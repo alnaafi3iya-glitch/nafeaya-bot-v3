@@ -238,7 +238,7 @@ def student_text(db, sid):
     waiting = queue_rows(db, sid, "waitlist")
     lines = [
         *SCHOOL_HEADER,
-        "🎓 <b>خاص بالطالبات</b>",
+        "<blockquote>🎓 <b>خاص بالطالبة</b></blockquote>",
         FLORAL_DIVIDER,
         f"🎙️ <b>تسجيل أدوار {html.escape(s['course'])}</b>",
     ]
@@ -277,7 +277,7 @@ def manager_text(db, sid):
     }.get(s["status"], s["status"])
     return "\n".join([
         *SCHOOL_HEADER,
-        "👑 <b>خاص بالمعلمة</b>",
+        "<blockquote>👑 <b>خاص بالمعلمة</b></blockquote>",
         FLORAL_DIVIDER,
         f"🛠 <b>إدارة حصة {html.escape(s['course'])}</b>",
         "",
