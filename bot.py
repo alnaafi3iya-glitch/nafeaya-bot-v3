@@ -87,6 +87,8 @@ GROUPS = {
     "رحلة الإتقان_تجويد": -1003960315040,
 }
 
+_STATIC_GROUPS = dict(GROUPS)          # المعرّفة في الكود؛ اللوحة تضيف إليها ولا تغيّرها
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -433,12 +435,112 @@ def apply_panel_stickers() -> None:
         print(f"🎭 ملصقات مخصّصة من اللوحة: {', '.join(changed)}")
 
 
+def _panel_headers() -> dict:
+    return {"Authorization": f"Bearer {PANEL_API_KEY}"}
+
+
+def apply_panel_groups() -> None:
+    """يضيف إلى GROUPS المجموعات التي اعتمدتها الإدارة في اللوحة. المعرّف في الكود يغلب دائمًا على اللوحة
+    (حتى لا تُحوَّل مجموعة المراقبة مثلًا بخطأ)، وأي عطل يترك القائمة الحالية كما هي."""
+    try:
+        r = requests.get(f"{PANEL_URL}/api/groups.json", headers=_panel_headers(), timeout=15)
+        r.raise_for_status()
+        groups = r.json().get("groups")
+    except Exception as exc:
+        print(f"⚠️ تعذرت قراءة مجموعات اللوحة ({exc})؛ تبقى المجموعات الحالية")
+        return
+    if not isinstance(groups, dict):
+        return
+    added = []
+    for name, cid in groups.items():
+        if not (isinstance(name, str) and name.strip() and isinstance(cid, int) and not isinstance(cid, bool)):
+            continue
+        if name in _STATIC_GROUPS and _STATIC_GROUPS[name] != cid:
+            print(f"⚠️ اللوحة تعرّف «{name}» بمعرّف مختلف عن الكود؛ يُعتمد ما في الكود")
+            continue
+        if name not in GROUPS:
+            added.append(name)
+        GROUPS[name] = cid
+    NORMALIZED_GROUPS.clear()
+    NORMALIZED_GROUPS.update({normalize_text(n): (n, c) for n, c in GROUPS.items()})
+    if added:
+        print(f"💬 مجموعات من اللوحة: {', '.join(added)}")
+
+
+_groups_seeded = False
+
+
+def seed_panel_groups_once() -> None:
+    """ينقل المجموعات المعرّفة في الكود إلى اللوحة (معتمدة) مرة واحدة لكل تشغيل؛ لا يكتب فوق ما فيها."""
+    global _groups_seeded
+    if _groups_seeded or DRY_RUN:
+        return
+    try:
+        r = requests.post(f"{PANEL_URL}/api/groups/seed", json={"groups": _STATIC_GROUPS},
+                          headers=_panel_headers(), timeout=15)
+        r.raise_for_status()
+        _groups_seeded = True
+        res = r.json()
+        print(f"💬 نُقلت مجموعات الكود إلى اللوحة: جديد {res.get('added')}، موجود {res.get('skipped')}")
+    except Exception as exc:
+        print(f"⚠️ تعذر نقل المجموعات إلى اللوحة الآن ({exc}); ستعاد المحاولة")
+
+
+def post_group_to_panel(chat_id: int, title: str, active: bool = True) -> None:
+    r = requests.post(f"{PANEL_URL}/api/groups/discover",
+                      json={"chat_id": chat_id, "title": title or "", "active": active},
+                      headers=_panel_headers(), timeout=15)
+    r.raise_for_status()
+
+
+async def _send_group_with_retry(chat_id: int, title: str, active: bool) -> bool:
+    for delay in (0, 3, 10, 30):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await asyncio.to_thread(post_group_to_panel, chat_id, title, active)
+            return True
+        except Exception as exc:
+            print(f"⚠️ تعذر إبلاغ اللوحة بالمجموعة {chat_id} ({exc})")
+    return False
+
+
+async def on_bot_chat_member(update, context) -> None:
+    """يُستدعى حين يُضاف البوت إلى مجموعة أو يُزال منها، فتظهر المجموعة في اللوحة بانتظار الاعتماد."""
+    m = update.my_chat_member
+    if not m or m.chat.type not in ("group", "supergroup"):
+        return
+    status = m.new_chat_member.status
+    if status in ("member", "administrator", "creator"):
+        active = True
+    elif status in ("left", "kicked"):
+        active = False
+    else:
+        return
+    await _send_group_with_retry(m.chat.id, m.chat.title or "", active)
+
+
+async def register_group_command(update, context) -> None:
+    """/register_group داخل مجموعة: تسجيلها في اللوحة يدويًا (للمجموعات التي أُضيف إليها البوت قبل هذه الميزة)."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+    allowed = {int(v.strip()) for v in os.getenv("ROLES_ADMIN_IDS", "").replace("،", ",").split(",") if v.strip().lstrip("-").isdigit()}
+    if user.id not in allowed:
+        return
+    ok = await _send_group_with_retry(chat.id, chat.title or "", True)
+    await msg.reply_text("أُرسلت المجموعة إلى اللوحة، اعتمديها من «المجموعات»." if ok
+                         else "تعذر الاتصال باللوحة الآن، أعيدي المحاولة بعد قليل.")
+
+
 def get_lessons() -> list[dict]:
     if PANEL_URL and PANEL_API_KEY:
         try:
             rows = get_lessons_from_panel()
             print("🧭 مصدر الحصص: لوحة الإدارة")
             apply_panel_stickers()
+            seed_panel_groups_once()
+            apply_panel_groups()
             return rows
         except Exception as exc:
             print(f"⚠️ تعذرت قراءة اللوحة ({exc})؛ الرجوع إلى الجدول القديم")
@@ -1309,17 +1411,25 @@ ROLES_ENABLED = env_bool("ROLES_ENABLED", False)
 
 async def start_roles_app():
     """يشغّل إضافة «أخذ الأدوار» (تحتاج استقبال أزرار تيليغرام). معطّلة ما لم يكن ROLES_ENABLED=true."""
-    if not ROLES_ENABLED or DRY_RUN:
+    discovery = bool(PANEL_URL and PANEL_API_KEY) and env_bool("GROUPS_DISCOVERY", True)
+    if DRY_RUN or not (ROLES_ENABLED or discovery):
         return None
-    from telegram.ext import Application
-    from roles_module import register_roles, panel_retry_loop
+    from telegram.ext import Application, ChatMemberHandler, CommandHandler
     application = Application.builder().token(TOKEN).build()
-    register_roles(application)
+    if ROLES_ENABLED:
+        from roles_module import register_roles
+        register_roles(application)
+    if discovery:
+        application.add_handler(ChatMemberHandler(on_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+        application.add_handler(CommandHandler("register_group", register_group_command))
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
-    application.bot_data["panel_retry_task"] = asyncio.create_task(panel_retry_loop())   # إعادة إرسال ما لم يصل إلى اللوحة
-    print("🎙️ إضافة الأدوار تعمل (polling)")
+    await application.updater.start_polling(
+        allowed_updates=["message", "callback_query", "my_chat_member"], drop_pending_updates=True)
+    if ROLES_ENABLED:
+        from roles_module import panel_retry_loop
+        application.bot_data["panel_retry_task"] = asyncio.create_task(panel_retry_loop())   # إعادة إرسال ما لم يصل إلى اللوحة
+    print(f"🎙️ التطبيق يعمل (polling): أدوار={'نعم' if ROLES_ENABLED else 'لا'}، اكتشاف المجموعات={'نعم' if discovery else 'لا'}")
     return application
 
 
