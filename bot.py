@@ -30,6 +30,7 @@ import sqlite3
 import pytz
 import tzdata
 import asyncio
+import time
 import signal
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -230,22 +231,50 @@ def preview_text(text: str | None, limit: int = 220) -> str:
     return compact if len(compact) <= limit else compact[:limit] + "..."
 
 
+# وجهة الإرسال: معرّف مجموعة عادي، أو «مسار» يجمع المجموعة والموضوع (Topic) في عدد صحيح واحد
+# (chat_id * 10^9 - thread_id) حتى تبقى بقية الشيفرة (الفرز، مفاتيح منع التكرار) تعمل دون تغيير.
+_ROUTE_MUL = 10 ** 9
+_ROUTE_MIN = 10 ** 16      # معرّفات تيليغرام الحقيقية أصغر من 10^14
+
+
+def make_route(chat_id: int, thread_id: int) -> int:
+    return chat_id * _ROUTE_MUL - thread_id
+
+
+def split_route(dest: int) -> tuple[int, int | None]:
+    """يفكّ الوجهة إلى (chat_id، thread_id أو None)."""
+    if abs(dest) < _ROUTE_MIN:
+        return dest, None
+    thread = (-dest) % _ROUTE_MUL
+    return (dest + thread) // _ROUTE_MUL, thread
+
+
+def dest_kwargs(dest: int) -> dict:
+    chat_id, thread_id = split_route(dest)
+    return {"chat_id": chat_id, **({"message_thread_id": thread_id} if thread_id else {})}
+
+
+def fmt_dest(dest: int) -> str:
+    chat_id, thread_id = split_route(dest)
+    return f"{chat_id}#{thread_id}" if thread_id else str(chat_id)
+
+
 async def send_text(bot: Bot, chat_id: int, text: str):
     if DRY_RUN:
-        print(f"🧾 [DRY_RUN] نص → chat_id={chat_id} | {preview_text(text)}")
+        print(f"🧾 [DRY_RUN] نص → chat_id={fmt_dest(chat_id)} | {preview_text(text)}")
         return None
     return await telegram_retry(
-        lambda: bot.send_message(chat_id=chat_id, text=test_banner(text)),
+        lambda: bot.send_message(text=test_banner(text), **dest_kwargs(chat_id)),
         "إرسال النص",
     )
 
 
 async def send_sticker(bot: Bot, chat_id: int, sticker: str):
     if DRY_RUN:
-        print(f"🧾 [DRY_RUN] ملصق → chat_id={chat_id} | {sticker_label(sticker)}")
+        print(f"🧾 [DRY_RUN] ملصق → chat_id={fmt_dest(chat_id)} | {sticker_label(sticker)}")
         return None
     return await telegram_retry(
-        lambda: bot.send_sticker(chat_id=chat_id, sticker=sticker),
+        lambda: bot.send_sticker(sticker=sticker, **dest_kwargs(chat_id)),
         f"إرسال ملصق {sticker_label(sticker)}",
     )
 
@@ -255,12 +284,12 @@ async def send_photo(bot: Bot, chat_id: int, photo: str, caption=None):
         caption = test_banner(caption)
     if DRY_RUN:
         print(
-            f"🧾 [DRY_RUN] صورة → chat_id={chat_id} | photo={photo!r}"
+            f"🧾 [DRY_RUN] صورة → chat_id={fmt_dest(chat_id)} | photo={photo!r}"
             + (f" | caption={preview_text(caption)}" if caption else "")
         )
         return None
     return await telegram_retry(
-        lambda: bot.send_photo(chat_id=chat_id, photo=photo, caption=caption),
+        lambda: bot.send_photo(photo=photo, caption=caption, **dest_kwargs(chat_id)),
         "إرسال الصورة",
     )
 
@@ -288,11 +317,11 @@ async def send_photo_or_fallback(
     if DRY_RUN:
         if photo:
             print(
-                f"🧾 [DRY_RUN] صورة أو بديل → سيُرسل الصورة | chat_id={chat_id} | "
+                f"🧾 [DRY_RUN] صورة أو بديل → سيُرسل الصورة | chat_id={fmt_dest(chat_id)} | "
                 f"photo={photo!r}" + (f" | caption={preview_text(caption)}" if caption else "")
             )
             return None
-        print(f"🧾 [DRY_RUN] صورة أو بديل → لا توجد صورة، سيُرسل النص البديل | chat_id={chat_id}")
+        print(f"🧾 [DRY_RUN] صورة أو بديل → لا توجد صورة، سيُرسل النص البديل | chat_id={fmt_dest(chat_id)}")
         return await send_text(bot, chat_id, fallback_text)
     if photo:
         try:
@@ -445,12 +474,20 @@ def apply_panel_groups() -> None:
     try:
         r = requests.get(f"{PANEL_URL}/api/groups.json", headers=_panel_headers(), timeout=15)
         r.raise_for_status()
-        groups = r.json().get("groups")
+        body = r.json()
+        groups = body.get("groups")
+        topics = body.get("topics") or {}
     except Exception as exc:
         print(f"⚠️ تعذرت قراءة مجموعات اللوحة ({exc})؛ تبقى المجموعات الحالية")
         return
     if not isinstance(groups, dict):
         return
+    if isinstance(topics, dict):          # موضوع (Topic) داخل مجموعة: يُعامَل كوجهة باسمه، ويُرسَل إليه بمعرّف الموضوع
+        for name, t in topics.items():
+            cid, tid = (t.get("chat_id"), t.get("thread_id")) if isinstance(t, dict) else (None, None)
+            if (isinstance(name, str) and name.strip() and isinstance(cid, int) and isinstance(tid, int)
+                    and not isinstance(cid, bool) and not isinstance(tid, bool) and tid > 0):
+                groups[name] = make_route(cid, tid)
     added = []
     for name, cid in groups.items():
         if not (isinstance(name, str) and name.strip() and isinstance(cid, int) and not isinstance(cid, bool)):
@@ -518,6 +555,50 @@ async def on_bot_chat_member(update, context) -> None:
     else:
         return
     await _send_group_with_retry(m.chat.id, m.chat.title or "", active)
+
+
+_topic_last_post: dict[tuple[int, int], tuple[float, str]] = {}
+TOPIC_REPOST_SECONDS = 600     # لا نكرر إبلاغ اللوحة بالموضوع نفسه أكثر من مرة كل 10 دقائق
+TOPIC_RETRY_SECONDS = 60       # بعد فشل الاتصال
+
+
+def post_topic_to_panel(chat_id: int, thread_id: int, title: str) -> None:
+    r = requests.post(f"{PANEL_URL}/api/topics/discover",
+                      json={"chat_id": chat_id, "thread_id": thread_id, "title": title or ""},
+                      headers=_panel_headers(), timeout=15)
+    r.raise_for_status()
+
+
+def _topic_title(msg) -> str:
+    """عنوان الموضوع إن حملته الرسالة: رسالة إنشاء الموضوع نفسها، أو الرد الافتراضي على رسالة إنشائه."""
+    for m in (msg, getattr(msg, "reply_to_message", None)):
+        created = getattr(m, "forum_topic_created", None) if m else None
+        name = getattr(created, "name", "") if created else ""
+        if name:
+            return str(name)
+    return ""
+
+
+async def on_topic_message(update, context) -> None:
+    """أي رسالة داخل موضوع من مجموعة: يُبلَغ بها اللوحة ليظهر الموضوع بانتظار الاعتماد (للمجموعات المعتمدة فقط)."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or chat.type != "supergroup":
+        return
+    thread_id = getattr(msg, "message_thread_id", None)
+    if not thread_id or not getattr(msg, "is_topic_message", False):
+        return
+    key, title = (chat.id, int(thread_id)), _topic_title(msg)
+    last = _topic_last_post.get(key)
+    now = time.monotonic()
+    if last and now - last[0] < TOPIC_REPOST_SECONDS and (last[1] or not title):
+        return
+    _topic_last_post[key] = (now - (TOPIC_REPOST_SECONDS - TOPIC_RETRY_SECONDS), title)   # يُعاد بعد دقيقة إن فشل
+    try:
+        await asyncio.to_thread(post_topic_to_panel, chat.id, int(thread_id), title)
+        _topic_last_post[key] = (now, title)
+    except Exception as exc:
+        print(f"⚠️ تعذر إبلاغ اللوحة بالموضوع {chat.id}#{thread_id} ({exc})")
 
 
 async def register_group_command(update, context) -> None:
@@ -1422,6 +1503,9 @@ async def start_roles_app():
     if discovery:
         application.add_handler(ChatMemberHandler(on_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         application.add_handler(CommandHandler("register_group", register_group_command))
+        if env_bool("TOPICS_DISCOVERY", True):
+            from telegram.ext import MessageHandler, filters
+            application.add_handler(MessageHandler(filters.ChatType.GROUPS, on_topic_message, block=False), group=-5)
     await application.initialize()
     await application.start()
     await application.updater.start_polling(
