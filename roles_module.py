@@ -39,10 +39,10 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
 log = logging.getLogger(__name__)
 
-FLORAL_DIVIDER = "\u200e⋆⊱༻𖥸༺⊰⋆"
-STAR_DIVIDER = "\u200e✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
+FLORAL_DIVIDER = "\u200f⋆⊱༻𖥸༺⊰⋆"
+STAR_DIVIDER = "\u200f✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
 # Retained as a wider option for layouts with more space.
-HEART_DIVIDER = "\u200e₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿︵‿︵‿︵ ˚₊"
+HEART_DIVIDER = "\u200f₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿︵‿︵‿︵ ˚₊"
 
 # A right-to-left mark anchors the emoji-only edges of the basmala line.
 SCHOOL_HEADER = (
@@ -277,7 +277,7 @@ def manager_text(db, sid):
     }.get(s["status"], s["status"])
     return "\n".join([
         *SCHOOL_HEADER,
-        "👩‍🏫 <b>خاص بالمعلمة</b>",
+        "👑 <b>خاص بالمعلمة</b>",
         FLORAL_DIVIDER,
         f"🛠 <b>إدارة حصة {html.escape(s['course'])}</b>",
         "",
