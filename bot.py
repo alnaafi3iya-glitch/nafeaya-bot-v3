@@ -116,6 +116,7 @@ def env_positive_int(name: str, default: int) -> int:
 TEST_MODE     = env_bool("TEST_MODE", False)
 DRY_RUN       = env_bool("DRY_RUN", False)
 FORCE_SEND    = env_bool("FORCE_SEND", False)
+SKIP_STICKER_ERRORS = env_bool("SKIP_STICKER_ERRORS", False)   # للبوت التجريبي: معرّفات الملصقات خاصة بكل بوت
 PAUSE_REMINDERS = env_bool("PAUSE_REMINDERS", False)
 COURSE_FILTER = os.getenv("COURSE_FILTER", "").strip()
 TEST_LIMIT    = env_positive_int("TEST_LIMIT", 1)
@@ -1192,6 +1193,9 @@ async def send_shared_stickers(bot, chat_id, stickers, marker, sent_stickers):
         try:
             await send_sticker(bot, chat_id, sticker)
         except Exception as exc:
+            if SKIP_STICKER_ERRORS and not isinstance(exc, NetworkError):
+                print(f"⚠️ تخطّي ملصق تعذّر إرساله (SKIP_STICKER_ERRORS): {exc}")
+                continue
             if not isinstance(exc, NetworkError):
                 release_delivery(*durable_key)
                 sent_stickers.discard(key)
