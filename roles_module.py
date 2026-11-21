@@ -11,7 +11,6 @@
     ROLES_DB_PATH: مسار SQLite مستقل، الافتراضي /data/roles.db.
     ROLES_TIMEZONE: المنطقة الزمنية للتقارير، الافتراضي Asia/Riyadh.
     ROLES_DEFAULT_CAPACITY: الحد الأساسي الافتراضي، 15.
-    ROLES_TELEGRAM_ADMINS: true (الافتراضي) تُعدّ مشرفات المجموعة في تيليغرام مديرات للجلسات؛ false لتعطيله.
 
 الأوامر داخل المجموعة أو الموضوع
     /roles_open اسم الحصة
@@ -39,7 +38,17 @@ from telegram.error import BadRequest, Forbidden
 from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
 log = logging.getLogger(__name__)
-SCHOOL_HEADER = ("✨﷽✨", "<b>المدرسة النافعية</b>", "")
+
+FLORAL_DIVIDER = "\u200e⋆⊱༻𖥸༺⊰⋆"
+STAR_DIVIDER = "\u200e✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
+# Retained as a wider option for layouts with more space.
+HEART_DIVIDER = "\u200e₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿︵‿︵‿︵ ˚₊"
+
+# A right-to-left mark anchors the emoji-only edges of the basmala line.
+SCHOOL_HEADER = (
+    "<blockquote>\u200f✨﷽✨\n<b>المدرسة النافعية</b></blockquote>",
+    "",
+)
 
 
 def read_ids(name):
@@ -166,28 +175,6 @@ def is_topic_staff(db, chat_id, thread_id, user_id):
         (chat_id, thread_id, user_id)).fetchone() is not None
 
 
-_ADMIN_CACHE = {}
-
-
-async def is_chat_admin(bot, chat_id, user_id):
-    """هل هي مشرفة (أو مالكة) في المجموعة في تيليغرام؟ نتيجة تُحفظ 60 ثانية؛ أي عطل = ليست مشرفة."""
-    if not TELEGRAM_ADMINS:
-        return False
-    key = (chat_id, user_id)
-    now = datetime.now().timestamp()
-    hit = _ADMIN_CACHE.get(key)
-    if hit and now - hit[0] < 60:
-        return hit[1]
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        value = getattr(member, "status", "") in ("administrator", "creator")
-    except Exception:
-        log.warning("تعذر فحص صلاحية المشرفة %s في %s", user_id, chat_id)
-        return False
-    _ADMIN_CACHE[key] = (now, value)
-    return value
-
-
 async def is_allowed_manager(update, context):
     user_id = update.effective_user.id
     if user_id in ADMIN_IDS:
@@ -196,7 +183,7 @@ async def is_allowed_manager(update, context):
     with closing(db_connect()) as db:
         if is_topic_staff(db, chat_id, thread_id, user_id):
             return True
-    return await is_chat_admin(context.bot, chat_id, user_id)
+    return False
 
 
 async def deny(message):
@@ -251,8 +238,8 @@ def student_text(db, sid):
     waiting = queue_rows(db, sid, "waitlist")
     lines = [
         *SCHOOL_HEADER,
-        "👩‍🎓 <b>خاص بالطالبات</b>",
-        "━━━━━━━━━━━━",
+        "🎓 <b>خاص بالطالبات</b>",
+        FLORAL_DIVIDER,
         f"🎙️ <b>تسجيل أدوار {html.escape(s['course'])}</b>",
     ]
     if main:
@@ -264,7 +251,7 @@ def student_text(db, sid):
     if waiting:
         lines += ["", "⏳ <b>قائمة الانتظار الاحتياطية:</b>"]
         lines += [f"{i}. {html.escape(e['display_name'])}" for i, e in enumerate(waiting, 1)]
-    lines += ["", "━━━━━━━━━━━━",
+    lines += ["", STAR_DIVIDER,
               f"📌 الأدوار الأساسية: <b>{len(main)} من {s['capacity']}</b>",
               f"🕰 قائمة الانتظار: <b>{len(waiting)}</b>"]
     state = {"open": "التسجيل مفتوح.", "running": "التسجيل مغلق وبدأت متابعة الأدوار.",
@@ -291,7 +278,7 @@ def manager_text(db, sid):
     return "\n".join([
         *SCHOOL_HEADER,
         "👩‍🏫 <b>خاص بالمعلمة</b>",
-        "━━━━━━━━━━━━",
+        FLORAL_DIVIDER,
         f"🛠 <b>إدارة حصة {html.escape(s['course'])}</b>",
         "",
         f"🔔 الحالة: <b>{html.escape(status_ar)}</b>",
@@ -520,9 +507,6 @@ async def callback(update, context):
         sid = int(raw_sid)
     except Exception:
         await q.answer("زر غير صالح.", show_alert=True); return
-    tg_admin = False
-    if action not in {"join", "cancel", "list"} and q.from_user.id not in ADMIN_IDS:
-        tg_admin = await is_chat_admin(context.bot, q.message.chat.id, q.from_user.id)
     with closing(db_connect()) as db:
         db.execute("BEGIN IMMEDIATE")
         s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
@@ -534,7 +518,7 @@ async def callback(update, context):
             return
         if q.message.chat.id != s["chat_id"] or callback_thread != s["thread_id"]:
             await q.answer("هذا الزر لا يخص هذا الموضوع.", show_alert=True); return
-        manager = tg_admin or is_topic_staff(db, s["chat_id"], s["thread_id"], q.from_user.id)
+        manager = is_topic_staff(db, s["chat_id"], s["thread_id"], q.from_user.id)
         if action == "join":
             if s["status"] != "open":
                 await q.answer("التسجيل مغلق.", show_alert=True); return
@@ -648,7 +632,7 @@ def report_text(db, sid, preview=False):
     parts = [
         *SCHOOL_HEADER,
         heading,
-        "━━━━━━━━━━━━",
+        FLORAL_DIVIDER,
         f"🎙️ الحصة: <b>{html.escape(s['course'])}</b>",
         f"👩‍🏫 إدارة الجلسة: <b>{html.escape(s['teacher'] or '—')}</b>",
         f"📅 التاريخ: <b>{started.strftime('%d/%m/%Y')}</b>",
@@ -670,7 +654,7 @@ def report_text(db, sid, preview=False):
     unresolved = sum(r["status"] in {"waiting", "current"} for r in rows)
     parts += [
         "",
-        "━━━━━━━━━━━━",
+        STAR_DIVIDER,
         "📊 <b>ملخص الأعداد</b>",
         f"👥 إجمالي المسجلات: <b>{len(rows)}</b>",
         f"✅ أتممن أدوارهن: <b>{completed}</b>",
@@ -735,7 +719,7 @@ async def set_sticker_command(update, context):
 
 def register_roles(application, *, group=0):
     """تهيئة قاعدة الأدوار وإضافة المعالجات مرة واحدة قبل بدء التطبيق."""
-    global ADMIN_IDS, ALLOWED_CHAT_IDS, DB_PATH, TZ, DEFAULT_CAPACITY, TELEGRAM_ADMINS
+    global ADMIN_IDS, ALLOWED_CHAT_IDS, DB_PATH, TZ, DEFAULT_CAPACITY
 
     if application.bot_data.get("roles_registered"):
         return
@@ -747,7 +731,6 @@ def register_roles(application, *, group=0):
     DB_PATH = Path(os.getenv("ROLES_DB_PATH", "/data/roles.db"))
     TZ = pytz.timezone(os.getenv("ROLES_TIMEZONE", "Asia/Riyadh"))
     DEFAULT_CAPACITY = max(1, int(os.getenv("ROLES_DEFAULT_CAPACITY", "15")))
-    TELEGRAM_ADMINS = os.getenv("ROLES_TELEGRAM_ADMINS", "true").strip().lower() not in {"0", "false", "no", "off"}
     init_db()
 
     commands = {
