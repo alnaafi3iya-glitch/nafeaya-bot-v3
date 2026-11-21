@@ -1,0 +1,6 @@
+python-telegram-bot>=21.0,<23
+requests>=2.31
+pytz
+tzdata
+apscheduler>=3.10,<4
+aiohttp>=3.9
