@@ -48,9 +48,10 @@ STAR_DIVIDER = "\u200f✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
 # Retained as a wider option for layouts with more space.
 HEART_DIVIDER = "\u200f₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿︵‿︵‿︵ ˚₊"
 
-# A right-to-left mark anchors the emoji-only edges of the basmala line.
+# علامة اليمين-إلى-اليسار تثبّت حواف الأسطر التي تبدأ برمز تعبيري.
+# لا نستعمل blockquote: يلصقه تيليغرام باليسار بينما بقية الأسطر محاذية لليمين.
 SCHOOL_HEADER = (
-    "<blockquote>\u200f✨﷽✨\n\u200f<b>المدرسة النافعية</b></blockquote>",
+    "\u200f✨﷽✨\n\u200f<b>المدرسة النافعية</b>",
     "",
 )
 
@@ -360,7 +361,7 @@ def student_text(db, sid):
     waiting = queue_rows(db, sid, "waitlist")
     lines = [
         *SCHOOL_HEADER,
-        "<blockquote>\u200f🎓 <b>خاص بالطالبة</b></blockquote>",
+        "\u200f🎓 <b>خاص بالطالبة</b>",
         FLORAL_DIVIDER,
         f"🎙️ <b>تسجيل أدوار {html.escape(s['course'])}</b>",
     ]
@@ -399,7 +400,7 @@ def manager_text(db, sid):
     }.get(s["status"], s["status"])
     return "\n".join([
         *SCHOOL_HEADER,
-        "<blockquote>\u200f👑 <b>خاص بالمعلمة</b></blockquote>",
+        "\u200f👑 <b>خاص بالمعلمة</b>",
         FLORAL_DIVIDER,
         f"🛠 <b>إدارة حصة {html.escape(s['course'])}</b>",
         "",
@@ -773,7 +774,7 @@ def report_text(db, sid, preview=False):
             section = [f"<b>{label}</b>"]
             if statuses == {"done"}:
                 section.extend(f"{i}. <b>{html.escape(name)}</b>" for i, name in enumerate(names, 1))
-                parts.extend(["", "<blockquote>" + "\n".join(section) + "</blockquote>"])
+                parts.extend(["", *section])
             else:
                 section.extend(f"{i}. {html.escape(name)}" for i, name in enumerate(names, 1))
                 parts.extend(["", *section])
