@@ -1312,12 +1312,13 @@ async def start_roles_app():
     if not ROLES_ENABLED or DRY_RUN:
         return None
     from telegram.ext import Application
-    from roles_module import register_roles
+    from roles_module import register_roles, panel_retry_loop
     application = Application.builder().token(TOKEN).build()
     register_roles(application)
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+    application.bot_data["panel_retry_task"] = asyncio.create_task(panel_retry_loop())   # إعادة إرسال ما لم يصل إلى اللوحة
     print("🎙️ إضافة الأدوار تعمل (polling)")
     return application
 
@@ -1325,6 +1326,9 @@ async def start_roles_app():
 async def stop_roles_app(application):
     if application is None:
         return
+    task = application.bot_data.get("panel_retry_task")
+    if task:
+        task.cancel()
     try:
         await application.updater.stop()
         await application.stop()

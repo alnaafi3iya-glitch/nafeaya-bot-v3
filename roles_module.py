@@ -11,6 +11,8 @@
     ROLES_DB_PATH: مسار SQLite مستقل، الافتراضي /data/roles.db.
     ROLES_TIMEZONE: المنطقة الزمنية للتقارير، الافتراضي Asia/Riyadh.
     ROLES_DEFAULT_CAPACITY: الحد الأساسي الافتراضي، 15.
+    PANEL_URL / PANEL_API_KEY: عنوان اللوحة ومفتاحها؛ إن ضُبطا أُرسلت لقطة كل جلسة إلى اللوحة بعد كل تغيير.
+    ROLES_TELEGRAM_ADMINS: true (الافتراضي) تُعدّ مشرفات المجموعة في تيليغرام مديرات للجلسات؛ false لتعطيله.
 
 الأوامر داخل المجموعة أو الموضوع
     /roles_open اسم الحصة
@@ -23,6 +25,7 @@
 عند التجربة، وتأكدي من صلاحية البوت لإرسال الرسائل وتثبيتها في المجموعة.
 """
 
+import asyncio
 import html
 import logging
 import os
@@ -32,6 +35,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytz
+import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
@@ -117,6 +121,8 @@ def init_db():
           added_by INTEGER NOT NULL,
           created_at TEXT NOT NULL,
           PRIMARY KEY(chat_id,thread_id,user_id));
+        CREATE TABLE IF NOT EXISTS panel_pending(
+          session_id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS stickers(
           scope_chat_id INTEGER NOT NULL DEFAULT 0,
           event TEXT NOT NULL,
@@ -141,6 +147,100 @@ def init_db():
 
 def now_iso():
     return datetime.now(TZ).isoformat()
+
+# ───────────── إرسال لقطات الجلسات إلى اللوحة ─────────────
+# كل تغيير يُرسل لقطة كاملة للجلسة؛ تُسجَّل الجلسة في panel_pending قبل الإرسال وتُحذف عند نجاحه،
+# فإن تعذّر الاتصال أعادت panel_retry_loop المحاولة. أي فشل هنا لا يؤثر في عمل الجلسة داخل تيليغرام.
+PANEL_URL = ""
+PANEL_API_KEY = ""
+_push_state = {}          # session_id -> "running" | "dirty"
+_push_tasks = set()
+
+
+def panel_enabled():
+    return bool(PANEL_URL and PANEL_API_KEY)
+
+
+def build_snapshot(db, sid):
+    s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+    if not s:
+        return None
+    rows = db.execute("""SELECT user_id,display_name,username,queue_type,status,position,registered_at
+                         FROM entries WHERE session_id=? ORDER BY queue_type,position""", (sid,)).fetchall()
+    return {
+        "session_key": s["session_key"], "chat_id": s["chat_id"], "thread_id": s["thread_id"],
+        "course": s["course"], "opened_by": s["teacher"] or "", "opened_at": s["created_at"],
+        "ended_at": s["ended_at"] or "", "status": s["status"], "capacity": s["capacity"],
+        "snapshot_at": now_iso(),
+        "entries": [{"user_id": r["user_id"], "display_name": r["display_name"], "username": r["username"] or "",
+                     "queue_type": r["queue_type"], "status": r["status"], "position": r["position"],
+                     "registered_at": r["registered_at"]} for r in rows],
+    }
+
+
+def _post_snapshot(payload):
+    r = requests.post(f"{PANEL_URL}/api/roles/session", json=payload, timeout=10,
+                      headers={"Authorization": f"Bearer {PANEL_API_KEY}"})
+    if r.status_code == 400:      # لقطة مرفوضة لا تُعاد محاولتها (لن تنجح أبدًا)
+        log.error("رفضت اللوحة لقطة الجلسة: %s", r.text[:200])
+        return True
+    r.raise_for_status()
+    return True
+
+
+async def push_session(sid):
+    """يرسل لقطة الجلسة؛ الاستدعاءات المتزامنة لنفس الجلسة تُدمج في إرسال لاحق واحد."""
+    if not panel_enabled():
+        return
+    if _push_state.get(sid):
+        _push_state[sid] = "dirty"; return
+    _push_state[sid] = "running"
+    try:
+        while True:
+            _push_state[sid] = "running"
+            with closing(db_connect()) as db:
+                db.execute("INSERT OR IGNORE INTO panel_pending(session_id) VALUES(?)", (sid,)); db.commit()
+                payload = build_snapshot(db, sid)
+            if payload is None:
+                with closing(db_connect()) as db:
+                    db.execute("DELETE FROM panel_pending WHERE session_id=?", (sid,)); db.commit()
+            else:
+                try:
+                    await asyncio.to_thread(_post_snapshot, payload)
+                    if _push_state.get(sid) != "dirty":
+                        with closing(db_connect()) as db:
+                            db.execute("DELETE FROM panel_pending WHERE session_id=?", (sid,)); db.commit()
+                except Exception as exc:
+                    log.warning("تعذّر إرسال الجلسة %s إلى اللوحة (ستُعاد المحاولة): %s", sid, exc)
+                    return
+            if _push_state.get(sid) != "dirty":
+                return
+    finally:
+        _push_state.pop(sid, None)
+
+
+def schedule_push(sid):
+    if not panel_enabled():
+        return
+    task = asyncio.create_task(push_session(sid))
+    _push_tasks.add(task)
+    task.add_done_callback(_push_tasks.discard)
+
+
+async def panel_retry_loop(interval=60):
+    """يعيد إرسال الجلسات التي لم تصل إلى اللوحة (انقطاع أو إعادة تشغيل)."""
+    while True:
+        await asyncio.sleep(interval)
+        if not panel_enabled():
+            continue
+        try:
+            with closing(db_connect()) as db:
+                ids = [r[0] for r in db.execute("SELECT session_id FROM panel_pending")]
+            for sid in ids:
+                await push_session(sid)
+        except Exception as exc:
+            log.warning("فشل دورة إعادة الإرسال إلى اللوحة: %s", exc)
+
 
 
 def scope(update):
@@ -175,6 +275,28 @@ def is_topic_staff(db, chat_id, thread_id, user_id):
         (chat_id, thread_id, user_id)).fetchone() is not None
 
 
+_ADMIN_CACHE = {}
+
+
+async def is_chat_admin(bot, chat_id, user_id):
+    """هل هي مشرفة (أو مالكة) في المجموعة في تيليغرام؟ نتيجة تُحفظ 60 ثانية؛ أي عطل = ليست مشرفة."""
+    if not TELEGRAM_ADMINS:
+        return False
+    key = (chat_id, user_id)
+    now = datetime.now().timestamp()
+    hit = _ADMIN_CACHE.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        value = getattr(member, "status", "") in ("administrator", "creator")
+    except Exception:
+        log.warning("تعذر فحص صلاحية المشرفة %s في %s", user_id, chat_id)
+        return False
+    _ADMIN_CACHE[key] = (now, value)
+    return value
+
+
 async def is_allowed_manager(update, context):
     user_id = update.effective_user.id
     if user_id in ADMIN_IDS:
@@ -183,7 +305,7 @@ async def is_allowed_manager(update, context):
     with closing(db_connect()) as db:
         if is_topic_staff(db, chat_id, thread_id, user_id):
             return True
-    return False
+    return await is_chat_admin(context.bot, chat_id, user_id)
 
 
 async def deny(message):
@@ -401,6 +523,7 @@ async def limit_command(update, context):
     if s:
         with closing(db_connect()) as promotion_db:
             promote_waitlist(promotion_db, s["id"])
+        schedule_push(s["id"])
         await refresh(context, s["id"])
     await update.effective_message.reply_text(f"الحد الأساسي الآن: {value}")
 
@@ -442,6 +565,7 @@ async def open_command(update, context):
     with closing(db_connect()) as db:
         db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
                    (student.message_id, manager.message_id, sid)); db.commit()
+    schedule_push(sid)
     await refresh(context, sid)
     try:
         await context.bot.pin_chat_message(chat_id, student.message_id, disable_notification=True)
@@ -507,6 +631,9 @@ async def callback(update, context):
         sid = int(raw_sid)
     except Exception:
         await q.answer("زر غير صالح.", show_alert=True); return
+    tg_admin = False
+    if action not in {"join", "cancel", "list"} and q.from_user.id not in ADMIN_IDS:
+        tg_admin = await is_chat_admin(context.bot, q.message.chat.id, q.from_user.id)
     with closing(db_connect()) as db:
         db.execute("BEGIN IMMEDIATE")
         s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
@@ -518,7 +645,7 @@ async def callback(update, context):
             return
         if q.message.chat.id != s["chat_id"] or callback_thread != s["thread_id"]:
             await q.answer("هذا الزر لا يخص هذا الموضوع.", show_alert=True); return
-        manager = is_topic_staff(db, s["chat_id"], s["thread_id"], q.from_user.id)
+        manager = tg_admin or is_topic_staff(db, s["chat_id"], s["thread_id"], q.from_user.id)
         if action == "join":
             if s["status"] != "open":
                 await q.answer("التسجيل مغلق.", show_alert=True); return
@@ -608,6 +735,8 @@ async def callback(update, context):
                 db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE id=?", (now_iso(), sid))
             db.commit()
     await q.answer(answer)
+    if action != "list":
+        schedule_push(sid)
     if action == "approve":
         await send_final_report(context, sid)
         with closing(db_connect()) as db:
@@ -719,7 +848,7 @@ async def set_sticker_command(update, context):
 
 def register_roles(application, *, group=0):
     """تهيئة قاعدة الأدوار وإضافة المعالجات مرة واحدة قبل بدء التطبيق."""
-    global ADMIN_IDS, ALLOWED_CHAT_IDS, DB_PATH, TZ, DEFAULT_CAPACITY
+    global ADMIN_IDS, ALLOWED_CHAT_IDS, DB_PATH, TZ, DEFAULT_CAPACITY, TELEGRAM_ADMINS, PANEL_URL, PANEL_API_KEY
 
     if application.bot_data.get("roles_registered"):
         return
@@ -731,6 +860,9 @@ def register_roles(application, *, group=0):
     DB_PATH = Path(os.getenv("ROLES_DB_PATH", "/data/roles.db"))
     TZ = pytz.timezone(os.getenv("ROLES_TIMEZONE", "Asia/Riyadh"))
     DEFAULT_CAPACITY = max(1, int(os.getenv("ROLES_DEFAULT_CAPACITY", "15")))
+    TELEGRAM_ADMINS = os.getenv("ROLES_TELEGRAM_ADMINS", "true").strip().lower() not in {"0", "false", "no", "off"}
+    PANEL_URL = os.getenv("PANEL_URL", "").strip().rstrip("/")
+    PANEL_API_KEY = os.getenv("PANEL_API_KEY", "").strip()
     init_db()
 
     commands = {

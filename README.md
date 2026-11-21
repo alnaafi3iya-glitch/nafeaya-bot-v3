@@ -14,3 +14,5 @@ ROLES_DB_PATH=/data/roles.db
 REMINDER_STATE_DB=/data/state.sqlite3
 
 أضيفي Volume على /data.
+
+ROLES_TELEGRAM_ADMINS=true   (اختياري؛ الافتراضي true: مشرفات المجموعة في تيليغرام = مديرات الجلسات)
