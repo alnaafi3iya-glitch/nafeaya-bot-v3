@@ -46,7 +46,7 @@ HEART_DIVIDER = "\u200f₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿�
 
 # A right-to-left mark anchors the emoji-only edges of the basmala line.
 SCHOOL_HEADER = (
-    "<blockquote>\u200f✨﷽✨\n<b>المدرسة النافعية</b></blockquote>",
+    "<blockquote>\u200f✨﷽✨\n\u200f<b>المدرسة النافعية</b></blockquote>",
     "",
 )
 
@@ -238,12 +238,12 @@ def student_text(db, sid):
     waiting = queue_rows(db, sid, "waitlist")
     lines = [
         *SCHOOL_HEADER,
-        "<blockquote>🎓 <b>خاص بالطالبة</b></blockquote>",
+        "<blockquote>\u200f🎓 <b>خاص بالطالبة</b></blockquote>",
         FLORAL_DIVIDER,
         f"🎙️ <b>تسجيل أدوار {html.escape(s['course'])}</b>",
     ]
     if main:
-        lines += ["", "📋 <b>الأدوار الأساسية:</b>"]
+        lines += ["", "📋 <b>الأدوار الأساسية:</b>", ""]
         lines += [f"{i}. {html.escape(e['display_name'])}" + (" ← الدور الحالي" if e["status"] == "current" else "")
                   for i, e in enumerate(main, 1)]
     else:
@@ -277,7 +277,7 @@ def manager_text(db, sid):
     }.get(s["status"], s["status"])
     return "\n".join([
         *SCHOOL_HEADER,
-        "<blockquote>👑 <b>خاص بالمعلمة</b></blockquote>",
+        "<blockquote>\u200f👑 <b>خاص بالمعلمة</b></blockquote>",
         FLORAL_DIVIDER,
         f"🛠 <b>إدارة حصة {html.escape(s['course'])}</b>",
         "",
@@ -492,8 +492,8 @@ async def announce_current(context, sid):
     if not current:
         return
     await send_sticker_event(context, s, "next")
-    mention = f"@{current['username']}" if current["username"] else html.escape(current["display_name"])
-    text = f"🎙️ الدور الحالي: <b>{mention}</b>"
+    display_name = html.escape(current["display_name"])
+    text = f"🎙️ الدور الحالي: <b>{display_name}</b>"
     if following:
         text += f"\nتستعد بعدها: {html.escape(following['display_name'])}"
     await context.bot.send_message(s["chat_id"], text, parse_mode=ParseMode.HTML, **session_scope(s))
