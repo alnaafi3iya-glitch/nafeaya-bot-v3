@@ -38,7 +38,11 @@ from telegram.error import BadRequest, Forbidden
 from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
 log = logging.getLogger(__name__)
-SCHOOL_HEADER = ("✨﷽✨", "<b>المدرسة النافعية</b>", "")
+# A right-to-left mark anchors the emoji-only edges of the basmala line.
+SCHOOL_HEADER = (
+    "<blockquote>\u200f✨﷽✨\n<b>المدرسة النافعية</b></blockquote>",
+    "",
+)
 
 
 def read_ids(name):
@@ -228,7 +232,7 @@ def student_text(db, sid):
     waiting = queue_rows(db, sid, "waitlist")
     lines = [
         *SCHOOL_HEADER,
-        "👩‍🎓 <b>خاص بالطالبات</b>",
+        "🎓 <b>خاص بالطالبات</b>",
         "━━━━━━━━━━━━",
         f"🎙️ <b>تسجيل أدوار {html.escape(s['course'])}</b>",
     ]
