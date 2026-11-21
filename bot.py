@@ -601,6 +601,35 @@ async def on_topic_message(update, context) -> None:
         print(f"⚠️ تعذر إبلاغ اللوحة بالموضوع {chat.id}#{thread_id} ({exc})")
 
 
+async def test_dest_command(update, context) -> None:
+    """/test_dest اسم: يرسل رسالة تجربة إلى وجهة (موضوع أو مجموعة) باسمها المعتمد في اللوحة، لاختبار مسار الإرسال.
+    للمعرّفات في ROLES_ADMIN_IDS فقط، وفي وضع التجربة TEST_MODE فقط، ولا يرسل إلا إلى وجهة داخل المجموعة التي كُتب فيها الأمر."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or chat.type not in ("group", "supergroup") or not user or not msg or not TEST_MODE:
+        return
+    allowed = {int(v.strip()) for v in os.getenv("ROLES_ADMIN_IDS", "").replace("،", ",").split(",") if v.strip().lstrip("-").isdigit()}
+    if user.id not in allowed:
+        return
+    name = " ".join(getattr(context, "args", None) or []).strip()
+    if not name:
+        await msg.reply_text("اكتبي اسم الموضوع بعد الأمر، مثل: /test_dest أم_سلمة")
+        return
+    await asyncio.to_thread(apply_panel_groups)                    # أحدث ما اعتُمد في اللوحة
+    found = NORMALIZED_GROUPS.get(normalize_text(name))
+    if not found:
+        await msg.reply_text("لا توجد وجهة بهذا الاسم؛ اعتمديها من «المجموعات» في اللوحة أولًا.")
+        return
+    label, dest = found
+    if split_route(dest)[0] != chat.id:
+        await msg.reply_text("هذه الوجهة في مجموعة أخرى؛ اكتبي الأمر داخل مجموعتها.")
+        return
+    try:
+        await send_text(context.bot, dest, f"رسالة تجربة إلى «{label}» ✅")
+        await msg.reply_text(f"أُرسلت رسالة التجربة إلى «{label}»" + (" (داخل الموضوع)." if split_route(dest)[1] else "."))
+    except Exception as exc:
+        await msg.reply_text(f"تعذر الإرسال: {exc}")
+
+
 async def register_group_command(update, context) -> None:
     """/register_group داخل مجموعة: تسجيلها في اللوحة يدويًا (للمجموعات التي أُضيف إليها البوت قبل هذه الميزة)."""
     chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
@@ -1503,6 +1532,7 @@ async def start_roles_app():
     if discovery:
         application.add_handler(ChatMemberHandler(on_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         application.add_handler(CommandHandler("register_group", register_group_command))
+        application.add_handler(CommandHandler("test_dest", test_dest_command))
         if env_bool("TOPICS_DISCOVERY", True):
             from telegram.ext import MessageHandler, filters
             application.add_handler(MessageHandler(filters.ChatType.GROUPS, on_topic_message, block=False), group=-5)
