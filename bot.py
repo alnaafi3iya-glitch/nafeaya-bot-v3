@@ -157,6 +157,8 @@ S_TODAY    = "CAACAgQAAyEFAATlXpvtAAICYGno5sKnai01XeYdmKTc3iEGsSVMAAKWCQACbCsAAV
 S_OPEN     = "CAACAgQAAyEFAATtPZnsAANvaes3DYRH38ri51PKwwdkNdEnIZsAAvQLAAL6YolRsy7lgWDnTzk7BA"
 S_HALF_HR  = "CAACAgQAAyEGAATtPZnsAAIGgWqhN264q0tpahoLiIgLGMrdu_JCAAIXEgAC7AMJUf5w7hckGy_RPQQ"
 S_EXCUSE   = "CAACAgQAAyEFAATtPZnsAAMNaej_2916xNz5YrgcZuuHJAG1VhUAAnwLAAJWgfBS3ZMj2356YYM7BA"
+S_EXCUSE_SHEIKH  = S_EXCUSE     # اعتذار الشيخ؛ يبقى مثل الافتراضي حتى تخصّصه اللوحة
+S_EXCUSE_TEACHER = S_EXCUSE     # اعتذار المعلمة
 
 # ملصقات التذكير الصباحي (جديدة، لتفادي تكرار الملصقات مع تذكير الـ30 دقيقة)
 S_SALAM2     = "CAACAgQAAxkBAAMZap6k4oa1r2nKgAIqW4F0v03VGR0AAsMmAAK77tFQRIS-yS2_usU9BA"
@@ -440,6 +442,7 @@ def get_lessons_from_panel() -> list[dict]:
 STICKER_ROLES = {
     "NAFEAYA": "شعار المدرسة", "SALAM": "السلام", "HALF_HR": "الحلقة بعد نصف ساعة", "OPEN": "فتح الغرفة",
     "EXCUSE": "اعتذار", "REMINDER": "تذكير", "TOMORROW": "غداً", "TODAY": "اليوم",
+    "EXCUSE_SHEIKH": "اعتذار الشيخ", "EXCUSE_TEACHER": "اعتذار المعلمة",
 }
 _DEFAULT_STICKERS = {k: globals()["S_" + k] for k in STICKER_ROLES}
 
@@ -460,6 +463,9 @@ def apply_panel_stickers() -> None:
     changed = []
     for role, default in _DEFAULT_STICKERS.items():
         fid = custom.get(role)
+        if role in ("EXCUSE_SHEIKH", "EXCUSE_TEACHER"):
+            general = custom.get("EXCUSE")      # الملصق العام للاعتذار احتياط إن لم يُخصَّص الشيخ/المعلمة
+            default = general.strip() if isinstance(general, str) and general.strip() else _DEFAULT_STICKERS["EXCUSE"]
         value = fid.strip() if isinstance(fid, str) and fid.strip() else default
         if globals()["S_" + role] != value:
             changed.append(STICKER_ROLES[role])
@@ -551,7 +557,7 @@ async def _send_group_with_retry(chat_id: int, title: str, active: bool) -> bool
 async def on_bot_chat_member(update, context) -> None:
     """يُستدعى حين يُضاف البوت إلى مجموعة أو يُزال منها، فتظهر المجموعة في اللوحة بانتظار الاعتماد."""
     m = update.my_chat_member
-    if not m or m.chat.type not in ("group", "supergroup"):
+    if not m or m.chat.type not in ("group", "supergroup", "channel"):
         return
     status = m.new_chat_member.status
     if status in ("member", "administrator", "creator"):
@@ -833,6 +839,15 @@ def is_multi(lesson: dict) -> bool:
     return normalize_text(lesson.get("نوع العرض", "")) == normalize_text("متعدد")
 
 
+def excuse_sticker(teacher: str) -> str:
+    """نفس قاعدة build_excuse: «شيخة» ← معلمة، «شيخ» ← شيخ، وغيرهما ← معلمة."""
+    if "شيخة" in teacher:
+        return S_EXCUSE_TEACHER
+    if "شيخ" in teacher:
+        return S_EXCUSE_SHEIKH
+    return S_EXCUSE_TEACHER
+
+
 def build_excuse(teacher: str, course: str, time_word: str) -> str:
     if "شيخة" in teacher:
         prefix = f"تعتذر {teacher}"
@@ -967,7 +982,7 @@ async def send_evening_reminders():
                 try:
                     if not claim_delivery(now.strftime("%Y-%m-%d"), "evening-apology", chat_id, course_name, teacher):
                         continue
-                    await send_sticker(bot, chat_id, S_EXCUSE)
+                    await send_sticker(bot, chat_id, excuse_sticker(teacher))
                     await asyncio.sleep(0.5)
                     await send_text(bot, chat_id, build_excuse(teacher, course_name, "غداً"))
                     print(f"✅ اعتذار ليلي → {group_name} | {course_name} | {teacher}")
@@ -1286,7 +1301,7 @@ async def send_day_reminders():
                     claimed = claim_delivery(now.strftime("%Y-%m-%d"), *delivery_key)
                     if not claimed:
                         continue
-                    await send_sticker(bot, chat_id, S_EXCUSE)
+                    await send_sticker(bot, chat_id, excuse_sticker(teacher))
                     await asyncio.sleep(0.5)
                     await send_text(bot, chat_id, build_excuse(teacher, course_name, "اليوم"))
                     content_sent = True
