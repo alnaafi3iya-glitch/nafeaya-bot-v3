@@ -117,6 +117,11 @@ TEST_MODE     = env_bool("TEST_MODE", False)
 DRY_RUN       = env_bool("DRY_RUN", False)
 FORCE_SEND    = env_bool("FORCE_SEND", False)
 SKIP_STICKER_ERRORS = env_bool("SKIP_STICKER_ERRORS", False)   # للبوت التجريبي: معرّفات الملصقات خاصة بكل بوت
+
+
+def is_bad_media_error(exc) -> bool:
+    """BadRequest في مكتبة تيليغرام يرث NetworkError، فنميّزه بالاسم لا بالوراثة."""
+    return exc.__class__.__name__ == "BadRequest"
 PAUSE_REMINDERS = env_bool("PAUSE_REMINDERS", False)
 COURSE_FILTER = os.getenv("COURSE_FILTER", "").strip()
 TEST_LIMIT    = env_positive_int("TEST_LIMIT", 1)
@@ -328,7 +333,7 @@ async def send_photo_or_fallback(
         try:
             return await send_photo(bot, chat_id, photo, caption=caption)
         except Exception as exc:
-            if isinstance(exc, NetworkError):
+            if isinstance(exc, NetworkError) and not (SKIP_STICKER_ERRORS and is_bad_media_error(exc)):
                 raise  # Delivery is uncertain; a fallback would duplicate it.
             print(f"⚠️ تعذر إرسال الصورة؛ أُرسل البديل النصي: {exc}")
     return await send_text(bot, chat_id, fallback_text)
@@ -1193,7 +1198,7 @@ async def send_shared_stickers(bot, chat_id, stickers, marker, sent_stickers):
         try:
             await send_sticker(bot, chat_id, sticker)
         except Exception as exc:
-            if SKIP_STICKER_ERRORS and not isinstance(exc, NetworkError):
+            if SKIP_STICKER_ERRORS and is_bad_media_error(exc):
                 print(f"⚠️ تخطّي ملصق تعذّر إرساله (SKIP_STICKER_ERRORS): {exc}")
                 continue
             if not isinstance(exc, NetworkError):
