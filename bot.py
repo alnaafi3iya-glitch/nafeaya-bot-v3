@@ -605,6 +605,9 @@ async def _send_group_with_retry(chat_id: int, title: str, active: bool) -> bool
 async def on_bot_chat_member(update, context) -> None:
     """يُستدعى حين يُضاف البوت إلى مجموعة أو يُزال منها، فتظهر المجموعة في اللوحة بانتظار الاعتماد."""
     m = update.my_chat_member
+    if m:
+        print(f"📥 حدث عضوية البوت: {m.chat.type} | {m.chat.id} | {m.chat.title or ''} | "
+              f"{m.old_chat_member.status} → {m.new_chat_member.status}")
     if not m or m.chat.type not in ("group", "supergroup", "channel"):
         return
     status = m.new_chat_member.status
@@ -614,7 +617,8 @@ async def on_bot_chat_member(update, context) -> None:
         active = False
     else:
         return
-    await _send_group_with_retry(m.chat.id, m.chat.title or "", active)
+    ok = await _send_group_with_retry(m.chat.id, m.chat.title or "", active)
+    print(f"{'✅ أُبلغت اللوحة' if ok else '❌ تعذر إبلاغ اللوحة'} بالمجموعة {m.chat.id}")
 
 
 _topic_last_post: dict[tuple[int, int], tuple[float, str]] = {}
@@ -1616,6 +1620,10 @@ async def start_roles_app():
             from telegram.ext import MessageHandler, filters
             application.add_handler(MessageHandler(filters.ChatType.GROUPS, on_topic_message, block=False), group=-5)
     await application.initialize()
+    try:
+        print(f"🤖 البوت المتصل: @{application.bot.username}")
+    except Exception:
+        pass
     await application.start()
     await application.updater.start_polling(
         allowed_updates=["message", "callback_query", "my_chat_member"], drop_pending_updates=True)
