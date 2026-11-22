@@ -422,18 +422,66 @@ PANEL_URL     = os.getenv("PANEL_URL", "").strip().rstrip("/")
 PANEL_API_KEY = os.getenv("PANEL_API_KEY", "").strip()
 
 
+PANEL_CACHE_FILE = os.getenv("PANEL_CACHE_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "panel_lessons_cache.json")
+PANEL_CACHE_MAX_AGE_HOURS = float(os.getenv("PANEL_CACHE_MAX_AGE_HOURS", "6") or 6)
+# الرجوع إلى الجدول القديم (Google Sheet) عند تعذّر اللوحة مغلق افتراضيًا: ذلك الجدول لا يعرف اعتذارات اللوحة
+# ولا تغيير المواعيد ولا الدورات المؤرشفة، فقد يرسل تذكيرًا خاطئًا. فعّليه بـ SHEET_FALLBACK=true إن أردتِه.
+SHEET_FALLBACK = env_bool("SHEET_FALLBACK", False)
+
+
+def _is_active(row: dict) -> bool:
+    return row.get("الحالة", "") in ("نشط", "اعتذار")
+
+
+def _save_panel_cache(cleaned: list[dict]) -> None:
+    try:
+        tmp = PANEL_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"saved_at": time.time(), "lessons": cleaned}, fh, ensure_ascii=False)
+        os.replace(tmp, PANEL_CACHE_FILE)
+    except Exception as exc:                       # الذاكرة المؤقتة تحسين فقط؛ فشلها لا يمنع التذكير
+        print(f"⚠️ تعذّر حفظ نسخة الحصص المؤقتة: {exc}")
+
+
+def _load_panel_cache():
+    """يعيد (الحصص النشطة، عمر النسخة بالدقائق) أو None إن لم توجد نسخة صالحة وحديثة."""
+    try:
+        with open(PANEL_CACHE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        age_min = (time.time() - float(data["saved_at"])) / 60
+        rows = data["lessons"]
+        if not isinstance(rows, list) or age_min > PANEL_CACHE_MAX_AGE_HOURS * 60:
+            return None
+        return [r for r in rows if _is_active(r)], int(age_min)
+    except Exception:
+        return None
+
+
 def get_lessons_from_panel() -> list[dict]:
-    r = requests.get(
-        f"{PANEL_URL}/api/lessons.json",
-        headers={"Authorization": f"Bearer {PANEL_API_KEY}"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    rows = r.json().get("lessons")
-    if not isinstance(rows, list):
-        raise ValueError("ردّ اللوحة لا يحتوي قائمة حصص")
+    last_exc: Exception | None = None
+    for attempt, wait in enumerate((0, 2, 5), start=1):       # ثلاث محاولات قبل اعتبار اللوحة متعذّرة
+        if wait:
+            time.sleep(wait)
+        try:
+            r = requests.get(
+                f"{PANEL_URL}/api/lessons.json",
+                headers={"Authorization": f"Bearer {PANEL_API_KEY}"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            rows = r.json().get("lessons")
+            if not isinstance(rows, list):
+                raise ValueError("ردّ اللوحة لا يحتوي قائمة حصص")
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"⚠️ محاولة {attempt}/3 لقراءة اللوحة فشلت: {exc}")
+    else:
+        raise last_exc  # type: ignore[misc]
     cleaned = [{str(k).strip(): ("" if v is None else str(v)).strip() for k, v in row.items()} for row in rows]
-    active = [row for row in cleaned if row.get("الحالة", "") in ("نشط", "اعتذار")]
+    _save_panel_cache(cleaned)
+    active = [row for row in cleaned if _is_active(row)]
     print(f"📋 الحصص النشطة/اعتذار: {len(active)}")
     return active
 
@@ -665,7 +713,14 @@ def get_lessons() -> list[dict]:
             apply_panel_groups()
             return rows
         except Exception as exc:
-            print(f"⚠️ تعذرت قراءة اللوحة ({exc})؛ الرجوع إلى الجدول القديم")
+            cached = _load_panel_cache()
+            if cached:
+                rows, age = cached
+                print(f"⚠️ تعذرت قراءة اللوحة ({exc})؛ استعمال آخر نسخة سليمة منها قبل {age} دقيقة")
+                return rows
+            if not SHEET_FALLBACK:
+                raise RuntimeError(f"تعذرت قراءة اللوحة ولا توجد نسخة سليمة حديثة منها: {exc}") from exc
+            print(f"⚠️ تعذرت قراءة اللوحة ({exc})؛ الرجوع إلى الجدول القديم (SHEET_FALLBACK)")
     return get_lessons_from_sheet()
 
 
