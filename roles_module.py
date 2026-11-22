@@ -162,6 +162,47 @@ def panel_enabled():
     return bool(PANEL_URL and PANEL_API_KEY)
 
 
+# ───────────── مفتاح التشغيل من اللوحة ─────────────
+# الأولوية: قاعدة الموضوع ثم المجموعة ثم المفتاح العام. إن تعذّر الاتصال بالجلب الأول يُسمح (السلوك القديم)،
+# وإن سبق نجاح الجلب استُعملت آخر قيمة معروفة.
+_settings_cache = {"at": 0.0, "data": None}
+SETTINGS_TTL = 30.0
+
+
+def _fetch_settings():
+    r = requests.get(f"{PANEL_URL}/api/roles/settings.json",
+                     headers={"Authorization": f"Bearer {PANEL_API_KEY}"}, timeout=8)
+    r.raise_for_status()
+    return r.json()
+
+
+def decide_enabled(data, chat_id, thread_id):
+    if not isinstance(data, dict):
+        return True
+    topics, groups = data.get("topics") or {}, data.get("groups") or {}
+    key = f"{chat_id}:{thread_id}"
+    if thread_id and key in topics:
+        return bool(topics[key])
+    if str(chat_id) in groups:
+        return bool(groups[str(chat_id)])
+    return bool(data.get("default", True))
+
+
+async def roles_enabled_here(chat_id, thread_id):
+    if not panel_enabled():
+        return True
+    import time
+    now = time.monotonic()
+    if _settings_cache["data"] is None or now - _settings_cache["at"] > SETTINGS_TTL:
+        try:
+            _settings_cache["data"] = await asyncio.to_thread(_fetch_settings)
+            _settings_cache["at"] = now
+        except Exception as exc:
+            log.warning("تعذر جلب إعدادات الأدوار من اللوحة: %s", exc)
+            _settings_cache["at"] = now - SETTINGS_TTL + 5   # إعادة المحاولة بعد 5 ثوانٍ
+    return decide_enabled(_settings_cache["data"], chat_id, thread_id)
+
+
 def build_snapshot(db, sid):
     s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
     if not s:
@@ -537,6 +578,9 @@ async def open_command(update, context):
     chat_id, thread_id = scope(update)
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
         await update.effective_message.reply_text("إدارة الأدوار غير مفعّلة في هذه المجموعة.")
+        return
+    if not await roles_enabled_here(chat_id, thread_id):
+        await update.effective_message.reply_text("أخذ الأدوار موقوف حاليًا في هذه الحصة. يمكن للإدارة تفعيله من اللوحة.")
         return
     typed_title = " ".join(context.args or []).strip()
     with closing(db_connect()) as db:
