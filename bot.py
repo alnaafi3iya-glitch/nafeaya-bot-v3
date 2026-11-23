@@ -665,6 +665,36 @@ async def on_topic_message(update, context) -> None:
         print(f"⚠️ تعذر إبلاغ اللوحة بالموضوع {chat.id}#{thread_id} ({exc})")
 
 
+async def start_command(update, context) -> None:
+    """/start في الخاص. برمز معلمة (من رابطها الخاص): تربط اللوحة حسابها وتردّ عليها برسالة الاعتذار الجاهزة."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or chat.type != "private" or not user or not msg:
+        return
+    arg = (context.args[0] if getattr(context, "args", None) else "").strip()
+    if not arg:
+        await msg.reply_text("السلام عليكم ورحمة الله وبركاته. هذا بوت المدرسة النافعية. "
+                             "إن كانت الإدارة أرسلت لكِ رابط ربط فاضغطيه من جديد.")
+        return
+    try:
+        r = await asyncio.to_thread(
+            lambda: requests.post(f"{PANEL_URL}/api/teachers/link", json={"start": arg, "telegram_id": user.id},
+                                  headers=_panel_headers(), timeout=15))
+    except Exception as exc:
+        print(f"⚠️ تعذر ربط معلمة: {exc}")
+        await msg.reply_text("تعذر الاتصال بالنظام الآن، أعيدي الضغط على الرابط بعد قليل.")
+        return
+    if r.status_code == 404:
+        await msg.reply_text("هذا الرابط غير صالح أو انتهت صلاحيته. اطلبي من الإدارة رابطًا جديدًا.")
+        return
+    if r.status_code != 200:
+        print(f"⚠️ ربط المعلمة رُفض: HTTP {r.status_code}")
+        await msg.reply_text("تعذر إتمام الربط الآن، أعيدي المحاولة بعد قليل أو راسلي الإدارة.")
+        return
+    data = r.json()
+    print(f"🔗 رُبط حساب تيليغرام بالمعلمة: {data.get('name')}")
+    await msg.reply_text("تم ربط حسابك بالبوت ✅\n\n" + data.get("message", ""), disable_web_page_preview=True)
+
+
 async def test_dest_command(update, context) -> None:
     """/test_dest اسم: يرسل رسالة تجربة إلى وجهة (موضوع أو مجموعة) باسمها المعتمد في اللوحة، لاختبار مسار الإرسال.
     للمعرّفات في ROLES_ADMIN_IDS فقط، وفي وضع التجربة TEST_MODE فقط، ولا يرسل إلا إلى وجهة داخل المجموعة التي كُتب فيها الأمر."""
@@ -1616,6 +1646,7 @@ async def start_roles_app():
         application.add_handler(ChatMemberHandler(on_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         application.add_handler(CommandHandler("register_group", register_group_command))
         application.add_handler(CommandHandler("test_dest", test_dest_command))
+        application.add_handler(CommandHandler("start", start_command))
         if env_bool("TOPICS_DISCOVERY", True):
             from telegram.ext import MessageHandler, filters
             application.add_handler(MessageHandler(filters.ChatType.GROUPS, on_topic_message, block=False), group=-5)
