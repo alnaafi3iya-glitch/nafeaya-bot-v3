@@ -937,7 +937,52 @@ def excuse_sticker(teacher: str) -> str:
     return S_EXCUSE_TEACHER
 
 
-def build_excuse(teacher: str, course: str, time_word: str) -> str:
+async def ping_makeup_reminders():
+    """يطلب من اللوحة إرسال تذكير «حدّدي موعد التعويض» للمعلمات اللاتي اخترن «لاحقًا» (اللوحة تحدد من يستحق وتمنع التكرار)."""
+    if not (PANEL_URL and PANEL_API_KEY) or DRY_RUN:
+        return
+    try:
+        r = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: requests.post(f"{PANEL_URL}/api/makeup-reminders/run", headers=_panel_headers(), timeout=30))
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("sent") or j.get("failed"):
+                print(f"🔔 تذكير التعويض: أُرسل {j.get('sent')} | فشل {j.get('failed')}")
+        else:
+            print(f"⚠️ تذكير التعويض: HTTP {r.status_code}")
+    except Exception as exc:
+        print(f"⚠️ تعذر طلب تذكير التعويض: {exc}")
+
+
+def build_makeup_block(lesson) -> str:
+    """سطور الحصة التعويضية في إعلان الاعتذار؛ فارغة إن لم تُذكر (اعتذار الإدارة/قديم)."""
+    if not lesson:
+        return ""
+    mk = str(lesson.get("تعويض", "") or "").strip()
+    if mk == "yes":
+        try:
+            md = datetime.strptime(str(lesson.get("تعويض_التاريخ", "")), "%Y-%m-%d")
+            h, m = parse_lesson_time(lesson)
+        except Exception:
+            return ""
+        mecca, egypt, morocco = format_times(h, m, target_date=md)
+        return (
+            f"{SEP}\n"
+            f"{RLM}📌 حصة تعويضية بإذن الله\n"
+            f"{RLM}🗓 {DAY_NAMES_AR[md.weekday()]} {LRE}{md.strftime('%d/%m/%Y')}{PDF}\n\n"
+            f"{RLM}🇸🇦 مكة: {mecca}\n"
+            f"{RLM}🇪🇬 مصر: {egypt}\n"
+            f"{RLM}🇲🇦 المغرب: {morocco}\n\n"
+        )
+    if mk == "no":
+        return (f"{SEP}\n{RLM}ℹ️ لا توجد حصة تعويضية لهذا الموعد، "
+                f"وننتظركم في مجلسكم القادم بإذن الله 🌿\n\n")
+    if mk == "later":
+        return f"{SEP}\n{RLM}⏳ سيُعلن موعد الحصة التعويضية لاحقًا بإذن الله\n\n"
+    return ""
+
+
+def build_excuse(teacher: str, course: str, time_word: str, lesson=None) -> str:
     if "شيخة" in teacher:
         prefix = f"تعتذر {teacher}"
         pronoun = "أمرها"
@@ -950,6 +995,7 @@ def build_excuse(teacher: str, course: str, time_word: str) -> str:
     return (
         f"{BISMILLAH}\n\n"
         f"{RLM}😔 {prefix} عن مجلس {course} {time_word}\n\n"
+        f"{build_makeup_block(lesson)}"
         f"{SEP}\n"
         f"يسّر الله {pronoun} وعوّضكم خيراً 🤍"
     )
@@ -1073,7 +1119,7 @@ async def send_evening_reminders():
                         continue
                     await send_sticker(bot, chat_id, excuse_sticker(teacher))
                     await asyncio.sleep(0.5)
-                    await send_text(bot, chat_id, build_excuse(teacher, course_name, "غداً"))
+                    await send_text(bot, chat_id, build_excuse(teacher, course_name, "غداً", ap))
                     print(f"✅ اعتذار ليلي → {group_name} | {course_name} | {teacher}")
                     sent += 1
                 except Exception as e:
@@ -1392,7 +1438,7 @@ async def send_day_reminders():
                         continue
                     await send_sticker(bot, chat_id, excuse_sticker(teacher))
                     await asyncio.sleep(0.5)
-                    await send_text(bot, chat_id, build_excuse(teacher, course_name, "اليوم"))
+                    await send_text(bot, chat_id, build_excuse(teacher, course_name, "اليوم", lesson))
                     content_sent = True
                     print(f"✅ اعتذار اليوم → {group_name} | {course_name}")
                     sent += 1
@@ -1742,6 +1788,16 @@ async def run_scheduler():
         name="تذكير اليوم",
         max_instances=1,
         misfire_grace_time=60,
+    )
+
+    # تذكير المعلمات بتحديد موعد التعويض — كل ساعة (اللوحة تقرّر من يستحق)
+    scheduler.add_job(
+        ping_makeup_reminders,
+        CronTrigger(minute=7, timezone="Asia/Riyadh"),
+        id="makeup_reminders",
+        name="تذكير تحديد التعويض",
+        max_instances=1,
+        misfire_grace_time=300,
     )
 
     roles_app = await start_roles_app()
