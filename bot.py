@@ -35,7 +35,7 @@ import signal
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, reset_tzpath
 from telegram import Bot
 try:
@@ -663,6 +663,36 @@ async def on_topic_message(update, context) -> None:
         _topic_last_post[key] = (now, title)
     except Exception as exc:
         print(f"⚠️ تعذر إبلاغ اللوحة بالموضوع {chat.id}#{thread_id} ({exc})")
+
+
+TEACHER_PLACES = env_bool("TEACHER_PLACES", False)      # اكتشاف أماكن الحصص: معطّل حتى يُفعَّل صراحة
+SEEN_REPOST_SECONDS = 600
+_seen_last: dict[tuple[int, int, int], float] = {}
+
+
+def post_teacher_seen(telegram_id: int, chat_id: int, thread_id: int, ts: str) -> None:
+    r = requests.post(f"{PANEL_URL}/api/teachers/seen",
+                      json={"telegram_id": telegram_id, "chat_id": chat_id, "thread_id": thread_id, "ts": ts},
+                      headers=_panel_headers(), timeout=15)
+    r.raise_for_status()
+
+
+async def on_teacher_seen(update, context) -> None:
+    """رسالة في مجموعة/موضوع: يُبلَغ بها اللوحة (المعرّف والمكان والوقت فقط، دون النص) لتقرر هل هي معلمة مربوطة أثناء حصتها."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not chat or not user or user.is_bot or chat.type not in ("group", "supergroup"):
+        return
+    thread_id = int(getattr(msg, "message_thread_id", 0) or 0) if getattr(msg, "is_topic_message", False) else 0
+    key, now = (user.id, chat.id, thread_id), time.monotonic()
+    if now - _seen_last.get(key, -SEEN_REPOST_SECONDS) < SEEN_REPOST_SECONDS:
+        return
+    _seen_last[key] = now
+    ts = (msg.date or datetime.now(timezone.utc)).isoformat()
+    try:
+        await asyncio.to_thread(post_teacher_seen, user.id, chat.id, thread_id, ts)
+    except Exception as exc:
+        _seen_last.pop(key, None)
+        print(f"⚠️ تعذر إبلاغ اللوحة بنشاط معلمة ({exc})")
 
 
 async def start_command(update, context) -> None:
@@ -1696,6 +1726,9 @@ async def start_roles_app():
         if env_bool("TOPICS_DISCOVERY", True):
             from telegram.ext import MessageHandler, filters
             application.add_handler(MessageHandler(filters.ChatType.GROUPS, on_topic_message, block=False), group=-5)
+        if TEACHER_PLACES:
+            from telegram.ext import MessageHandler, filters
+            application.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_teacher_seen, block=False), group=-4)
     await application.initialize()
     try:
         print(f"🤖 البوت المتصل: @{application.bot.username}")
