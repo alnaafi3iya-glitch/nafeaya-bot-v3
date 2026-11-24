@@ -267,12 +267,12 @@ def fmt_dest(dest: int) -> str:
     return f"{chat_id}#{thread_id}" if thread_id else str(chat_id)
 
 
-async def send_text(bot: Bot, chat_id: int, text: str):
+async def send_text(bot: Bot, chat_id: int, text: str, markup=None):
     if DRY_RUN:
         print(f"🧾 [DRY_RUN] نص → chat_id={fmt_dest(chat_id)} | {preview_text(text)}")
         return None
     return await telegram_retry(
-        lambda: bot.send_message(text=test_banner(text), **dest_kwargs(chat_id)),
+        lambda: bot.send_message(text=test_banner(text), **({"reply_markup": markup} if markup else {}), **dest_kwargs(chat_id)),
         "إرسال النص",
     )
 
@@ -287,7 +287,7 @@ async def send_sticker(bot: Bot, chat_id: int, sticker: str):
     )
 
 
-async def send_photo(bot: Bot, chat_id: int, photo: str, caption=None):
+async def send_photo(bot: Bot, chat_id: int, photo: str, caption=None, markup=None):
     if TEST_MODE and caption:
         caption = test_banner(caption)
     if DRY_RUN:
@@ -297,7 +297,7 @@ async def send_photo(bot: Bot, chat_id: int, photo: str, caption=None):
         )
         return None
     return await telegram_retry(
-        lambda: bot.send_photo(photo=photo, caption=caption, **dest_kwargs(chat_id)),
+        lambda: bot.send_photo(photo=photo, caption=caption, **({"reply_markup": markup} if markup else {}), **dest_kwargs(chat_id)),
         "إرسال الصورة",
     )
 
@@ -319,7 +319,7 @@ async def telegram_retry(operation, label: str, attempts: int = 3):
 
 
 async def send_photo_or_fallback(
-    bot: Bot, chat_id: int, photo: str, *, caption: str | None, fallback_text: str
+    bot: Bot, chat_id: int, photo: str, *, caption: str | None, fallback_text: str, markup=None
 ):
     """الصورة هي الأصل، والنص لا يُرسل إلا إن غابت الصورة أو فشل إرسالها."""
     if DRY_RUN:
@@ -333,12 +333,12 @@ async def send_photo_or_fallback(
         return await send_text(bot, chat_id, fallback_text)
     if photo:
         try:
-            return await send_photo(bot, chat_id, photo, caption=caption)
+            return await send_photo(bot, chat_id, photo, caption=caption, markup=markup)
         except Exception as exc:
             if isinstance(exc, NetworkError) and not (SKIP_STICKER_ERRORS and is_bad_media_error(exc)):
                 raise  # Delivery is uncertain; a fallback would duplicate it.
             print(f"⚠️ تعذر إرسال الصورة؛ أُرسل البديل النصي: {exc}")
-    return await send_text(bot, chat_id, fallback_text)
+    return await send_text(bot, chat_id, fallback_text, markup=markup)
 
 
 async def report_failure(bot: Bot, message: str):
@@ -494,6 +494,19 @@ STICKER_ROLES = {
 }
 _DEFAULT_STICKERS = {k: globals()["S_" + k] for k in STICKER_ROLES}
 
+# ملصقات خاصة بدورة بعينها من اللوحة: {اسم الدورة المطبّع: {الدور: معرّف}}. الشعار ثابت دائمًا؛ و«اليوم» عام (تذكير صباحي مشترك).
+COURSE_STICKER_ROLES = ("SALAM", "HALF_HR", "OPEN", "EXCUSE_SHEIKH", "EXCUSE_TEACHER", "EXCUSE", "REMINDER", "TOMORROW")
+COURSE_STICKERS: dict[str, dict[str, str]] = {}
+
+
+def sticker_for(role: str, course: str | None = None) -> str:
+    """ملصق الدور؛ وإن كان للدورة ملصق خاص في هذا الدور فهو الأولى، وإلا فالعام (المعدَّل من اللوحة أو المضمّن)."""
+    if course and role in COURSE_STICKER_ROLES:
+        fid = COURSE_STICKERS.get(normalize_text(course), {}).get(role)
+        if fid:
+            return fid
+    return globals()["S_" + role]
+
 
 def apply_panel_stickers() -> None:
     """يقرأ ملصقات اللوحة المفعّلة ويطبّقها؛ ما لم تخصّصه اللوحة يبقى على ملصقه المضمّن. أي عطل يترك الحالية."""
@@ -504,10 +517,27 @@ def apply_panel_stickers() -> None:
             timeout=15,
         )
         r.raise_for_status()
-        custom = r.json().get("stickers") or {}
+        body = r.json()
+        custom = body.get("stickers") or {}
+        raw_course = body.get("course_stickers") or {}
     except Exception as exc:
         print(f"⚠️ تعذرت قراءة ملصقات اللوحة ({exc})؛ تبقى الملصقات الحالية")
         return
+    per_course = {}
+    if isinstance(raw_course, dict):
+        for cname, roles in raw_course.items():
+            if not isinstance(roles, dict):
+                continue
+            ok = {k: v.strip() for k, v in roles.items()
+                  if k in COURSE_STICKER_ROLES and isinstance(v, str) and v.strip()}
+            if ok:
+                per_course[normalize_text(cname)] = ok
+                for k, v in ok.items():
+                    STICKER_LABELS[v] = f"{STICKER_ROLES[k]} ({cname})"
+    if per_course != COURSE_STICKERS:
+        print(f"🎭 ملصقات خاصة بالدورات: {', '.join(sorted(per_course)) or 'لا شيء'}")
+    COURSE_STICKERS.clear()
+    COURSE_STICKERS.update(per_course)
     changed = []
     for role, default in _DEFAULT_STICKERS.items():
         fid = custom.get(role)
@@ -958,13 +988,17 @@ def is_multi(lesson: dict) -> bool:
     return normalize_text(lesson.get("نوع العرض", "")) == normalize_text("متعدد")
 
 
-def excuse_sticker(teacher: str) -> str:
-    """نفس قاعدة build_excuse: «شيخة» ← معلمة، «شيخ» ← شيخ، وغيرهما ← معلمة."""
-    if "شيخة" in teacher:
-        return S_EXCUSE_TEACHER
-    if "شيخ" in teacher:
-        return S_EXCUSE_SHEIKH
-    return S_EXCUSE_TEACHER
+def excuse_sticker(teacher: str, course: str | None = None) -> str:
+    """نفس قاعدة build_excuse: «شيخة» ← معلمة، «شيخ» ← شيخ، وغيرهما ← معلمة.
+    وللدورة ملصقها الخاص إن وُجد (الدور نفسه ثم اعتذار الدورة العام) قبل العام."""
+    role = "EXCUSE_SHEIKH" if ("شيخ" in teacher and "شيخة" not in teacher) else "EXCUSE_TEACHER"
+    if course:
+        mine = COURSE_STICKERS.get(normalize_text(course), {})
+        if mine.get(role):
+            return mine[role]
+        if mine.get("EXCUSE"):
+            return mine["EXCUSE"]
+    return S_EXCUSE_SHEIKH if role == "EXCUSE_SHEIKH" else S_EXCUSE_TEACHER
 
 
 async def ping_makeup_reminders():
@@ -1147,7 +1181,7 @@ async def send_evening_reminders():
                 try:
                     if not claim_delivery(now.strftime("%Y-%m-%d"), "evening-apology", chat_id, course_name, teacher):
                         continue
-                    await send_sticker(bot, chat_id, excuse_sticker(teacher))
+                    await send_sticker(bot, chat_id, excuse_sticker(teacher, course_name))
                     await asyncio.sleep(0.5)
                     await send_text(bot, chat_id, build_excuse(teacher, course_name, "غداً", ap))
                     print(f"✅ اعتذار ليلي → {group_name} | {course_name} | {teacher}")
@@ -1178,7 +1212,7 @@ async def send_evening_reminders():
                     if not claim_delivery(now.strftime("%Y-%m-%d"), "evening", chat_id, course_name):
                         continue
                     await send_shared_stickers(bot, chat_id, (S_NAFEAYA,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
-                    await send_shared_stickers(bot, chat_id, (S_SALAM,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
+                    await send_shared_stickers(bot, chat_id, (sticker_for("SALAM", course_name),), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
                     await send_photo_or_fallback(
                         bot, chat_id, img, caption=None, fallback_text=fallback_text
                     )
@@ -1250,8 +1284,8 @@ async def send_evening_reminders():
                         if not claim_delivery(now.strftime("%Y-%m-%d"), "evening", chat_id, course_name):
                             continue
                         await send_shared_stickers(bot, chat_id, (S_NAFEAYA,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
-                        await send_shared_stickers(bot, chat_id, (S_SALAM,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
-                        await send_shared_stickers(bot, chat_id, (S_REMINDER,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (sticker_for("SALAM", course_name),), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (sticker_for("REMINDER", course_name),), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
                         await send_text(bot, chat_id, text)
                         print(f"✅ ليلي (قديم/متعدد) → {group_name} | {course_name}")
                         sent += 1
@@ -1282,8 +1316,8 @@ async def send_evening_reminders():
                         if not claim_delivery(now.strftime("%Y-%m-%d"), "evening", chat_id, course_name):
                             continue
                         await send_shared_stickers(bot, chat_id, (S_NAFEAYA,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
-                        await send_shared_stickers(bot, chat_id, (S_SALAM,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
-                        await send_shared_stickers(bot, chat_id, (S_TOMORROW,), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (sticker_for("SALAM", course_name),), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (sticker_for("TOMORROW", course_name),), ("evening" if normalize_text(group_name) in {normalize_text("تفاعلية"), normalize_text("نافعية")} else course_name), shared_stickers)
                         await send_photo_or_fallback(
                             bot, chat_id, data["img_course"],
                             caption=None, fallback_text=time_text,
@@ -1395,6 +1429,32 @@ def _get_day_sent_keys(today_str: str) -> set:
     return _DAY_SENT_KEYS_BY_DATE.setdefault(today_str, set())
 
 
+def class_join_markup(lesson: dict):
+    """زر «أنضم إلى طالبات هذه الحصة» تحت رسالة التذكير؛ معطّل ما لم يكن CLASS_JOIN_BUTTON=true.
+    لا يؤثر فيه أي فشل، فتُرسل رسالة التذكير بلا زر."""
+    if DRY_RUN or not (ROLES_ENABLED and env_bool("CLASS_JOIN_BUTTON", False)):
+        return None
+    try:
+        import students_module
+        return students_module.join_markup(lesson.get("الدورة", "").strip(), lesson.get("المعلمة", "").strip())
+    except Exception as exc:
+        print(f"⚠️ تعذر إعداد زر الانضمام إلى طالبات الحصة: {exc}")
+        return None
+
+
+def class_courses_in_dest(chat_id: int, thread_id: int) -> list[tuple[str, str]]:
+    """(الدورة، المعلمة) للحصص المرتبطة بهذه المجموعة أو هذا الموضوع؛ يعتمد آخر نسخة من اللوحة إن وُجدت."""
+    cached = _load_panel_cache()
+    rows = [r for r in cached[0] if _is_active(r)] if cached else get_lessons()
+    out = []
+    for lesson in rows:
+        for _, dest in get_all_course_chat_ids(lesson):
+            chat, thread = split_route(dest)
+            if chat == chat_id and (thread or 0) == (thread_id or 0):
+                out.append((lesson.get("الدورة", "").strip(), lesson.get("المعلمة", "").strip()))
+    return out
+
+
 async def roles_auto_open(bot, lesson: dict, dest: int) -> None:
     """بعد نجاح تذكير الثلاثين دقيقة: يفتح أخذ الأدوار في الوجهة نفسها إن فُعّلت الحصة في اللوحة. لا يؤثر فيه أي فشل."""
     if DRY_RUN or not ROLES_ENABLED or not env_bool("ROLES_AUTO_OPEN", True):
@@ -1482,7 +1542,7 @@ async def send_day_reminders():
                     claimed = claim_delivery(now.strftime("%Y-%m-%d"), *delivery_key)
                     if not claimed:
                         continue
-                    await send_sticker(bot, chat_id, excuse_sticker(teacher))
+                    await send_sticker(bot, chat_id, excuse_sticker(teacher, course_name))
                     await asyncio.sleep(0.5)
                     await send_text(bot, chat_id, build_excuse(teacher, course_name, "اليوم", lesson))
                     content_sent = True
@@ -1512,15 +1572,15 @@ async def send_day_reminders():
                     claimed = claim_delivery(now.strftime("%Y-%m-%d"), *delivery_key)
                     if not claimed:
                         continue
-                    await send_shared_stickers(bot, chat_id, (S_NAFEAYA, S_SALAM, S_HALF_HR), (h, m), shared_stickers)
+                    await send_shared_stickers(bot, chat_id, (S_NAFEAYA, sticker_for("SALAM", course_name), sticker_for("HALF_HR", course_name)), (h, m), shared_stickers)
                     await send_photo_or_fallback(
                         bot, chat_id, img_today, caption=room_text,
-                        fallback_text=fallback_text,
+                        fallback_text=fallback_text, markup=class_join_markup(lesson),
                     )
                     content_sent = True
                     if link:
                         await asyncio.sleep(0.5)
-                        await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (sticker_for("OPEN", course_name),), (h, m), shared_stickers)
                     await roles_auto_open(bot, lesson, chat_id)
                     print(f"✅ اليوم (متعدد/تصميم) → {group_name} | {course_name} | {teacher}")
                     sent += 1
@@ -1560,12 +1620,12 @@ async def send_day_reminders():
                         claimed = claim_delivery(now.strftime("%Y-%m-%d"), *delivery_key)
                         if not claimed:
                             continue
-                        await send_shared_stickers(bot, chat_id, (S_NAFEAYA, S_SALAM, S_HALF_HR), (h, m), shared_stickers)
-                        await send_text(bot, chat_id, text)
+                        await send_shared_stickers(bot, chat_id, (S_NAFEAYA, sticker_for("SALAM", course_name), sticker_for("HALF_HR", course_name)), (h, m), shared_stickers)
+                        await send_text(bot, chat_id, text, markup=class_join_markup(lesson))
                         content_sent = True
                         if link:
                             await asyncio.sleep(0.5)
-                            await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                            await send_shared_stickers(bot, chat_id, (sticker_for("OPEN", course_name),), (h, m), shared_stickers)
                         await roles_auto_open(bot, lesson, chat_id)
                         print(f"✅ اليوم (قديم/نص) → {group_name} | {course_name}")
                         sent += 1
@@ -1586,7 +1646,7 @@ async def send_day_reminders():
                         claimed = claim_delivery(now.strftime("%Y-%m-%d"), *delivery_key)
                         if not claimed:
                             continue
-                        await send_shared_stickers(bot, chat_id, (S_NAFEAYA, S_SALAM, S_HALF_HR), (h, m), shared_stickers)
+                        await send_shared_stickers(bot, chat_id, (S_NAFEAYA, sticker_for("SALAM", course_name), sticker_for("HALF_HR", course_name)), (h, m), shared_stickers)
                         fallback_text = (
                             f"{BISMILLAH}\n\n{RLM}⏰ الحصة بعد 30 دقيقة\n"
                             f"🌿 {display_course_label(course_name)}\n{SEP}\n👑 {teacher}\n"
@@ -1599,12 +1659,12 @@ async def send_day_reminders():
                         )
                         await send_photo_or_fallback(
                             bot, chat_id, img_course, caption=caption,
-                            fallback_text=fallback_text,
+                            fallback_text=fallback_text, markup=class_join_markup(lesson),
                         )
                         content_sent = True
                         if link:
                             await asyncio.sleep(0.5)
-                            await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                            await send_shared_stickers(bot, chat_id, (sticker_for("OPEN", course_name),), (h, m), shared_stickers)
                         await roles_auto_open(bot, lesson, chat_id)
                         print(f"✅ اليوم (قديم/صورة) → {group_name} | {course_name}")
                         sent += 1
@@ -1737,6 +1797,8 @@ async def start_roles_app():
     if ROLES_ENABLED:
         from roles_module import register_roles
         register_roles(application)
+        from students_module import register_students
+        register_students(application, courses_in_dest=class_courses_in_dest)
     if discovery:
         application.add_handler(ChatMemberHandler(on_bot_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         application.add_handler(CommandHandler("register_group", register_group_command))

@@ -754,6 +754,12 @@ async def callback(update, context):
                            (sid, q.from_user.id, q.from_user.full_name or "مشاركة", q.from_user.username,
                             queue_type, pos, now_iso()))
             db.commit()
+            try:                                                # من أخذت دورًا فهي من طالبات الحصة؛ لا يؤثر فيه أي عطل
+                import students_module
+                students_module.add_member(s["course"], q.from_user.id, q.from_user.full_name,
+                                           q.from_user.username, "roles")
+            except Exception:
+                log.exception("تعذر تسجيل انتماء الطالبة من الأدوار")
             answer = "سُجل دورك في القائمة الأساسية." if queue_type == "main" else "سُجلتِ في قائمة الانتظار."
         elif action == "cancel":
             row = db.execute(
