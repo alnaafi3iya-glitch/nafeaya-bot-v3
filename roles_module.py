@@ -45,6 +45,8 @@ log = logging.getLogger(__name__)
 
 CALL_EMOJI = "🔔"      # يسبق اسم الطالبة المستدعاة
 FLORAL_DIVIDER = "\u200f⋆⊱༻𖥸༺⊰⋆"
+# تيليغرام يحذف الأسطر الفارغة في بداية الرسالة، فيُستعمل حرف فارغ مرئي الارتفاع
+BLANK_LINE = "\u2800"
 STAR_DIVIDER = "\u200f✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
 # Retained as a wider option for layouts with more space.
 HEART_DIVIDER = "\u200f₊˚ ‿︵‿︵‿︵୨୧ · · ♡ · · ୨୧‿︵‿︵‿︵ ˚₊"
@@ -858,9 +860,11 @@ def report_text(db, sid, preview=False):
     started = datetime.fromisoformat(s["created_at"]).astimezone(TZ)
     heading = "🔎 <b>معاينة تقرير الحصة</b>" if preview else "📋 <b>التقرير النهائي للحصة</b>"
     parts = [
+        BLANK_LINE,
         *SCHOOL_HEADER,
         heading,
         FLORAL_DIVIDER,
+        "",
         f"🎙️ الحصة: <b>{html.escape(s['course'])}</b>",
         f"👩‍🏫 إدارة الجلسة: <b>{html.escape(s['teacher'] or '—')}</b>",
         f"📅 التاريخ: <b>{started.strftime('%d/%m/%Y')}</b>",
