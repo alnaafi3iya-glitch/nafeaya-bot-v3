@@ -43,6 +43,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
 log = logging.getLogger(__name__)
 
+CALL_EMOJI = "🔔"      # يسبق اسم الطالبة المستدعاة
 FLORAL_DIVIDER = "\u200f⋆⊱༻𖥸༺⊰⋆"
 STAR_DIVIDER = "\u200f✦•┈๑⋅⋯ ⋯⋅๑┈•✦"
 # Retained as a wider option for layouts with more space.
@@ -408,7 +409,8 @@ def student_text(db, sid):
     ]
     if main:
         lines += ["", "📋 <b>الأدوار الأساسية:</b>", ""]
-        lines += [f"{i}. {html.escape(e['display_name'])}" + (" ← الدور الحالي" if e["status"] == "current" else "")
+        lines += [f"{i}. " + (f"{CALL_EMOJI} " if e["status"] == "current" else "") + html.escape(e["display_name"])
+                  + (" ← الدور الحالي" if e["status"] == "current" else "")
                   for i, e in enumerate(main, 1)]
     else:
         lines += ["", "لم تسجل أي مشاركة بعد."]
@@ -688,8 +690,9 @@ async def announce_current(context, sid):
     if not current:
         return
     await send_sticker_event(context, s, "next")
-    display_name = html.escape(current["display_name"])
-    text = f"🎙️ الدور الحالي: <b>{display_name}</b>"
+    # إشارة بالضغط على الاسم: يصل الطالبة إشعار من تيليغرام فتنتبه لاستدعائها
+    display_name = f'<a href="tg://user?id={int(current["user_id"])}">{html.escape(current["display_name"])}</a>'
+    text = f"{CALL_EMOJI} الدور الحالي: <b>{display_name}</b>"
     if following:
         text += f"\nتستعد بعدها: {html.escape(following['display_name'])}"
     await context.bot.send_message(s["chat_id"], text, parse_mode=ParseMode.HTML, **session_scope(s))
@@ -924,9 +927,9 @@ def _norm_course(name):
 
 
 async def auto_enabled_here(course, chat_id, thread_id):
-    """مفعّل للحصة في اللوحة (auto_courses)، ولم يُوقَف صراحةً لموضوعها أو مجموعتها. تعذّر الجلب = لا فتح."""
+    """(مفعّل؟، السبب). مفعّل للحصة في اللوحة (auto_courses) ولم يُوقَف صراحةً لموضوعها أو مجموعتها. تعذّر الجلب = لا فتح."""
     if not panel_enabled():
-        return False
+        return False, "PANEL_URL/PANEL_API_KEY غير مضبوطين في البوت"
     import time
     now = time.monotonic()
     if _settings_cache["data"] is None or now - _settings_cache["at"] > SETTINGS_TTL:
@@ -936,21 +939,28 @@ async def auto_enabled_here(course, chat_id, thread_id):
         except Exception as exc:
             log.warning("تعذر جلب إعدادات الأدوار من اللوحة: %s", exc)
             _settings_cache["at"] = now - SETTINGS_TTL + 5
-    return decide_auto(_settings_cache["data"], course, chat_id, thread_id)
+    return decide_auto_reason(_settings_cache["data"], course, chat_id, thread_id)
 
 
-def decide_auto(data, course, chat_id, thread_id):
+def decide_auto_reason(data, course, chat_id, thread_id):
     if not isinstance(data, dict):
-        return False
-    if _norm_course(course) not in {_norm_course(c) for c in (data.get("auto_courses") or [])}:
-        return False
+        return False, "تعذر جلب إعدادات الأدوار من اللوحة"
+    if "auto_courses" not in data:
+        return False, "اللوحة لا ترسل قائمة الفتح التلقائي (انشري اللوحة 2.31.0 أو أحدث)"
+    listed = [_norm_course(c) for c in (data.get("auto_courses") or [])]
+    if _norm_course(course) not in listed:
+        return False, f"الحصة «{_norm_course(course)}» ليست في قائمة الفتح التلقائي بعد الحفظ (المفعّلة: {'، '.join(listed) or 'لا شيء'})"
     topics, groups = data.get("topics") or {}, data.get("groups") or {}
     key = f"{chat_id}:{thread_id}"
     if thread_id and key in topics and not topics[key]:
-        return False
+        return False, "الموضوع موقوف صراحةً في صفحة تشغيل الأدوار"
     if str(chat_id) in groups and not groups[str(chat_id)] and not (thread_id and key in topics):
-        return False
-    return True
+        return False, "المجموعة موقوفة صراحةً في صفحة تشغيل الأدوار"
+    return True, "ok"
+
+
+def decide_auto(data, course, chat_id, thread_id):
+    return decide_auto_reason(data, course, chat_id, thread_id)[0]
 
 
 class _BotCtx:
@@ -964,8 +974,9 @@ async def auto_open_session(bot, course, teacher, chat_id, thread_id=0):
         return False, "إضافة الأدوار غير مهيّأة"
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
         return False, "المجموعة خارج ROLES_ALLOWED_CHAT_IDS"
-    if not await auto_enabled_here(course, chat_id, thread_id):
-        return False, "الفتح التلقائي غير مفعّل لهذه الحصة أو الوجهة"
+    allowed, why = await auto_enabled_here(course, chat_id, thread_id)
+    if not allowed:
+        return False, why
     title = (course or "").strip() or "الحصة"
     with closing(db_connect()) as db:
         if active_session(db, chat_id, thread_id):
