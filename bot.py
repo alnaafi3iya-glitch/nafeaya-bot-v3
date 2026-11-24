@@ -1395,6 +1395,22 @@ def _get_day_sent_keys(today_str: str) -> set:
     return _DAY_SENT_KEYS_BY_DATE.setdefault(today_str, set())
 
 
+async def roles_auto_open(bot, lesson: dict, dest: int) -> None:
+    """بعد نجاح تذكير الثلاثين دقيقة: يفتح أخذ الأدوار في الوجهة نفسها إن فُعّلت الحصة في اللوحة. لا يؤثر فيه أي فشل."""
+    if DRY_RUN or not ROLES_ENABLED or not env_bool("ROLES_AUTO_OPEN", True):
+        return
+    try:
+        import roles_module
+        chat_id, thread_id = split_route(dest)
+        await asyncio.sleep(1)
+        ok, why = await roles_module.auto_open_session(
+            bot, lesson.get("الدورة", "").strip(), lesson.get("المعلمة", "").strip(), chat_id, thread_id or 0)
+        print(f"{'🎙️ فُتحت جلسة الأدوار' if ok else 'ℹ️ لم تُفتح جلسة الأدوار'} → {fmt_dest(dest)} | {lesson.get('الدورة', '').strip()}"
+              + ("" if ok else f" ({why})"))
+    except Exception as exc:
+        print(f"⚠️ تعذر فتح جلسة الأدوار تلقائيًا → {fmt_dest(dest)}: {exc}")
+
+
 async def send_day_reminders():
     bot  = Bot(token=TOKEN)
     now  = datetime.now(TZ)
@@ -1505,6 +1521,7 @@ async def send_day_reminders():
                     if link:
                         await asyncio.sleep(0.5)
                         await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                    await roles_auto_open(bot, lesson, chat_id)
                     print(f"✅ اليوم (متعدد/تصميم) → {group_name} | {course_name} | {teacher}")
                     sent += 1
                 except Exception as e:
@@ -1549,6 +1566,7 @@ async def send_day_reminders():
                         if link:
                             await asyncio.sleep(0.5)
                             await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                        await roles_auto_open(bot, lesson, chat_id)
                         print(f"✅ اليوم (قديم/نص) → {group_name} | {course_name}")
                         sent += 1
                     except Exception as e:
@@ -1587,6 +1605,7 @@ async def send_day_reminders():
                         if link:
                             await asyncio.sleep(0.5)
                             await send_shared_stickers(bot, chat_id, (S_OPEN,), (h, m), shared_stickers)
+                        await roles_auto_open(bot, lesson, chat_id)
                         print(f"✅ اليوم (قديم/صورة) → {group_name} | {course_name}")
                         sent += 1
                     except Exception as e:

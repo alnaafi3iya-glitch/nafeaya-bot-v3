@@ -482,9 +482,36 @@ def sticker_id(db, chat_id, event):
     return row["file_id"] if row else None
 
 
+BUNDLED_STICKERS = {"open": Path(__file__).resolve().parent / "assets" / "roles_open.webp"}
+_bundled_ids = {}          # event -> file_id بعد أول رفع (يوفّر إعادة الرفع)
+
+
+async def _send_bundled_sticker(context, s, event):
+    """ملصق افتراضي مرفق مع الكود، يُستعمل فقط إن لم تُضبط الإدارة ملصقًا بـ /roles_setsticker."""
+    path = BUNDLED_STICKERS.get(event)
+    if not path or not path.is_file():
+        return None
+    try:
+        file_id = _bundled_ids.get(event)
+        if file_id:
+            await context.bot.send_sticker(s["chat_id"], file_id, **session_scope(s))
+        else:
+            with open(path, "rb") as fh:
+                msg = await context.bot.send_sticker(s["chat_id"], fh, **session_scope(s))
+            if getattr(msg, "sticker", None):
+                _bundled_ids[event] = msg.sticker.file_id
+        return True
+    except (BadRequest, Forbidden):
+        _bundled_ids.pop(event, None)
+        log.exception("تعذر إرسال الملصق الافتراضي %s", event)
+        return False
+
+
 async def send_sticker_event(context, s, event):
     with closing(db_connect()) as db:
         file_id = sticker_id(db, s["chat_id"], event)
+    if not file_id:
+        return await _send_bundled_sticker(context, s, event)
     if file_id:
         try:
             await context.bot.send_sticker(s["chat_id"], file_id, **session_scope(s))
@@ -889,6 +916,95 @@ async def set_sticker_command(update, context):
                    (event, replied.sticker.file_id)); db.commit()
     await update.effective_message.reply_text("✅ ظهر الملصق التجريبي وحُفظ بنجاح.")
 
+
+
+# ───────────── الفتح التلقائي بعد تذكير الثلاثين دقيقة ─────────────
+def _norm_course(name):
+    return " ".join((name or "").split())
+
+
+async def auto_enabled_here(course, chat_id, thread_id):
+    """مفعّل للحصة في اللوحة (auto_courses)، ولم يُوقَف صراحةً لموضوعها أو مجموعتها. تعذّر الجلب = لا فتح."""
+    if not panel_enabled():
+        return False
+    import time
+    now = time.monotonic()
+    if _settings_cache["data"] is None or now - _settings_cache["at"] > SETTINGS_TTL:
+        try:
+            _settings_cache["data"] = await asyncio.to_thread(_fetch_settings)
+            _settings_cache["at"] = now
+        except Exception as exc:
+            log.warning("تعذر جلب إعدادات الأدوار من اللوحة: %s", exc)
+            _settings_cache["at"] = now - SETTINGS_TTL + 5
+    return decide_auto(_settings_cache["data"], course, chat_id, thread_id)
+
+
+def decide_auto(data, course, chat_id, thread_id):
+    if not isinstance(data, dict):
+        return False
+    if _norm_course(course) not in {_norm_course(c) for c in (data.get("auto_courses") or [])}:
+        return False
+    topics, groups = data.get("topics") or {}, data.get("groups") or {}
+    key = f"{chat_id}:{thread_id}"
+    if thread_id and key in topics and not topics[key]:
+        return False
+    if str(chat_id) in groups and not groups[str(chat_id)] and not (thread_id and key in topics):
+        return False
+    return True
+
+
+class _BotCtx:
+    def __init__(self, bot):
+        self.bot = bot
+
+
+async def auto_open_session(bot, course, teacher, chat_id, thread_id=0):
+    """يفتح جلسة أدوار في وجهة الحصة بعد تذكيرها. يعيد (True, 'opened') أو (False, السبب)."""
+    if not ADMIN_IDS:
+        return False, "إضافة الأدوار غير مهيّأة"
+    if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+        return False, "المجموعة خارج ROLES_ALLOWED_CHAT_IDS"
+    if not await auto_enabled_here(course, chat_id, thread_id):
+        return False, "الفتح التلقائي غير مفعّل لهذه الحصة أو الوجهة"
+    title = (course or "").strip() or "الحصة"
+    with closing(db_connect()) as db:
+        if active_session(db, chat_id, thread_id):
+            return False, "توجد جلسة مفتوحة بالفعل في هذه الوجهة"
+        setting = topic_setting(db, chat_id, thread_id)
+        capacity = setting["capacity"] if setting else DEFAULT_CAPACITY
+        db.execute("""INSERT INTO topic_settings(chat_id,thread_id,title,capacity) VALUES(?,?,?,?)
+                      ON CONFLICT(chat_id,thread_id) DO UPDATE SET title=excluded.title""",
+                   (chat_id, thread_id, title, capacity))
+        cur = db.execute("""INSERT INTO sessions(session_key,chat_id,thread_id,course,teacher,starts_at,status,
+                          capacity,waitlist_open,opened_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                         (unique_key(chat_id, thread_id), chat_id, thread_id, title, (teacher or "").strip(),
+                          now_iso(), "open", capacity, 1, 0, now_iso()))
+        sid = cur.lastrowid
+        db.commit()
+        s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+    ctx = _BotCtx(bot)
+    try:
+        try:
+            await send_sticker_event(ctx, s, "open")            # الملصق قبل الجلسة؛ فشله لا يمنع الفتح
+        except Exception:
+            log.exception("تعذر إرسال ملصق بدء الأدوار")
+        student = await bot.send_message(chat_id, "جاري فتح الأدوار…", **thread_kwargs(thread_id))
+        manager = await bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
+        with closing(db_connect()) as db:
+            db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
+                       (student.message_id, manager.message_id, sid)); db.commit()
+        schedule_push(sid)
+        await refresh(ctx, sid)
+    except Exception:
+        with closing(db_connect()) as db:                       # جلسة بلا رسائل تحجز الوجهة؛ تُنهى كي لا تمنع غدًا
+            db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE id=? AND message_id IS NULL",
+                       (now_iso(), sid)); db.commit()
+        raise
+    try:
+        await bot.pin_chat_message(chat_id, student.message_id, disable_notification=True)
+    except (BadRequest, Forbidden):
+        log.warning("تعذر تثبيت رسالة الجلسة")
+    return True, "opened"
 
 
 def register_roles(application, *, group=0):
