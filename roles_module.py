@@ -360,11 +360,15 @@ def unique_key(chat_id, thread_id):
 
 
 def student_keyboard(sid, status, waitlist_open):
+    if status in ("running", "paused"):                  # بعد إغلاق التسجيل: الاعتذار واللائحة فقط
+        return InlineKeyboardMarkup([[InlineKeyboardButton("♻️ اعتذار", callback_data=f"roles:excuse:{sid}"),
+                                      InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]])
     if status != "open":
         return InlineKeyboardMarkup([[InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]])
     rows = [[InlineKeyboardButton("📝 أخذ دور", callback_data=f"roles:join:{sid}"),
              InlineKeyboardButton("❌ إلغاء دوري", callback_data=f"roles:cancel:{sid}")],
-            [InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]]
+            [InlineKeyboardButton("♻️ اعتذار", callback_data=f"roles:excuse:{sid}"),
+             InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]]
     if not waitlist_open:
         rows.append([InlineKeyboardButton("قائمة الانتظار مغلقة", callback_data=f"roles:list:{sid}")])
     return InlineKeyboardMarkup(rows)
@@ -380,6 +384,7 @@ def manager_keyboard(sid, status, waitlist_open):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ اكتمل الدور", callback_data=f"roles:done:{sid}"),
          InlineKeyboardButton("⏭ غائبة", callback_data=f"roles:absent:{sid}")],
+        [InlineKeyboardButton("♻️ معتذرة", callback_data=f"roles:excusenow:{sid}")],
         [InlineKeyboardButton("🔄 إلى آخر اللائحة", callback_data=f"roles:defer:{sid}"),
          InlineKeyboardButton("▶️ استدعاء الحالية", callback_data=f"roles:next:{sid}")],
         [InlineKeyboardButton("🔒 إغلاق التسجيل", callback_data=f"roles:close:{sid}"),
@@ -707,7 +712,7 @@ async def callback(update, context):
     except Exception:
         await q.answer("زر غير صالح.", show_alert=True); return
     tg_admin = False
-    if action not in {"join", "cancel", "list"} and q.from_user.id not in ADMIN_IDS:
+    if action not in {"join", "cancel", "excuse", "list"} and q.from_user.id not in ADMIN_IDS:
         tg_admin = await is_chat_admin(context.bot, q.message.chat.id, q.from_user.id)
     with closing(db_connect()) as db:
         db.execute("BEGIN IMMEDIATE")
@@ -726,7 +731,7 @@ async def callback(update, context):
                 await q.answer("التسجيل مغلق.", show_alert=True); return
             existing = db.execute("SELECT * FROM entries WHERE session_id=? AND user_id=?",
                                   (sid, q.from_user.id)).fetchone()
-            if existing and existing["status"] != "cancelled":
+            if existing and existing["status"] not in ("cancelled", "excused"):
                 await q.answer("لديك دور مسجل بالفعل.", show_alert=True); return
             main_count = db.execute(
                 "SELECT COUNT(*) FROM entries WHERE session_id=? AND queue_type='main' AND status IN ('waiting','current')",
@@ -762,6 +767,22 @@ async def callback(update, context):
                 announce = True
             db.commit()
             answer = "أُلغي دورك."
+        elif action == "excuse":
+            row = db.execute(
+                "SELECT * FROM entries WHERE session_id=? AND user_id=? AND status IN ('waiting','current')",
+                (sid, q.from_user.id)).fetchone()
+            if not row:
+                await q.answer("لا يوجد لك دور مسجَّل لتعتذري عنه.", show_alert=True); return
+            if s["status"] not in ("open", "running", "paused"):
+                await q.answer("انتهت الجلسة.", show_alert=True); return
+            db.execute("UPDATE entries SET status='excused' WHERE id=?", (row["id"],))
+            if row["queue_type"] == "main":
+                promote_waitlist(db, sid)
+            if row["status"] == "current":
+                advance(db, sid)
+                announce = True
+            db.commit()
+            answer = "سُجّل اعتذارك، جزاكِ الله خيرًا."
         elif action == "list":
             answer = "تم تحديث اللائحة."
         else:
@@ -771,11 +792,12 @@ async def callback(update, context):
             if action == "close":
                 db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
                 advance(db, sid); announce = True
-            elif action in {"done", "absent"}:
+            elif action in {"done", "absent", "excusenow"}:
                 current = current_entry(db, sid)
                 if not current:
                     await q.answer("لا يوجد دور حالي.", show_alert=True); return
-                db.execute("UPDATE entries SET status=? WHERE id=?", (action, current["id"]))
+                db.execute("UPDATE entries SET status=? WHERE id=?",
+                           ("excused" if action == "excusenow" else action, current["id"]))
                 promote_waitlist(db, sid); advance(db, sid); announce = True
             elif action == "defer":
                 current = current_entry(db, sid)
@@ -828,9 +850,11 @@ def report_text(db, sid, preview=False):
     s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
     rows = db.execute("SELECT * FROM entries WHERE session_id=? ORDER BY registered_at,id", (sid,)).fetchall()
     groups = [({"done"}, "✅ أتممن أدوارهن"),
-              ({"absent"}, "⏭ غائبات عند النداء"),
-              ({"cancelled"}, "❌ ألغين أدوارهن"),
+              ({"absent"}, "❌ غائبات عند النداء"),
+              ({"excused"}, "♻️ معتذرات"),
+              ({"cancelled"}, "↩️ ألغين أدوارهن"),
               ({"waiting", "current"}, "⌛ لم تُحسم أدوارهن")]
+    mark = {"done": "✅", "absent": "❌", "excused": "♻️", "cancelled": "↩️", "waiting": "⌛", "current": "⌛"}
     started = datetime.fromisoformat(s["created_at"]).astimezone(TZ)
     heading = "🔎 <b>معاينة تقرير الحصة</b>" if preview else "📋 <b>التقرير النهائي للحصة</b>"
     parts = [
@@ -843,17 +867,18 @@ def report_text(db, sid, preview=False):
         f"🕰 وقت الفتح: <b>{started.strftime('%H:%M')}</b>",
     ]
     for statuses, label in groups:
-        names = [r["display_name"] for r in rows if r["status"] in statuses]
-        if names:
+        chosen = [r for r in rows if r["status"] in statuses]
+        if chosen:
             section = [f"<b>{label}</b>"]
             if statuses == {"done"}:
-                section.extend(f"{i}. <b>{html.escape(name)}</b>" for i, name in enumerate(names, 1))
+                section.extend(f"{i}. {mark[r['status']]} <b>{html.escape(r['display_name'])}</b>" for i, r in enumerate(chosen, 1))
                 parts.extend(["", *section])
             else:
-                section.extend(f"{i}. {html.escape(name)}" for i, name in enumerate(names, 1))
+                section.extend(f"{i}. {mark[r['status']]} {html.escape(r['display_name'])}" for i, r in enumerate(chosen, 1))
                 parts.extend(["", *section])
     completed = sum(r["status"] == "done" for r in rows)
     absent = sum(r["status"] == "absent" for r in rows)
+    excused = sum(r["status"] == "excused" for r in rows)
     cancelled = sum(r["status"] == "cancelled" for r in rows)
     unresolved = sum(r["status"] in {"waiting", "current"} for r in rows)
     parts += [
@@ -862,8 +887,9 @@ def report_text(db, sid, preview=False):
         "📊 <b>ملخص الأعداد</b>",
         f"👥 إجمالي المسجلات: <b>{len(rows)}</b>",
         f"✅ أتممن أدوارهن: <b>{completed}</b>",
-        f"⏭ غائبات عند النداء: <b>{absent}</b>",
-        f"❌ ألغين أدوارهن: <b>{cancelled}</b>",
+        f"❌ غائبات عند النداء: <b>{absent}</b>",
+        f"♻️ معتذرات: <b>{excused}</b>",
+        f"↩️ ألغين أدوارهن: <b>{cancelled}</b>",
         f"⌛ أدوار غير محسومة: <b>{unresolved}</b>",
     ]
     if preview:
