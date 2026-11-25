@@ -1793,7 +1793,7 @@ async def start_roles_app():
     if DRY_RUN or not (ROLES_ENABLED or discovery):
         return None
     from telegram.ext import Application, ChatMemberHandler, CommandHandler
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
     if ROLES_ENABLED:
         from roles_module import register_roles
         register_roles(application)
@@ -1821,6 +1821,8 @@ async def start_roles_app():
     if ROLES_ENABLED:
         from roles_module import panel_retry_loop
         application.bot_data["panel_retry_task"] = asyncio.create_task(panel_retry_loop())   # إعادة إرسال ما لم يصل إلى اللوحة
+        from roles_module import start_command_loop
+        application.bot_data["panel_command_task"] = start_command_loop(application)       # أوامر المعلمات من صفحتها في اللوحة
     print(f"🎙️ التطبيق يعمل (polling): أدوار={'نعم' if ROLES_ENABLED else 'لا'}، اكتشاف المجموعات={'نعم' if discovery else 'لا'}")
     return application
 
@@ -1828,9 +1830,10 @@ async def start_roles_app():
 async def stop_roles_app(application):
     if application is None:
         return
-    task = application.bot_data.get("panel_retry_task")
-    if task:
-        task.cancel()
+    for name in ("panel_retry_task", "panel_command_task"):
+        task = application.bot_data.get(name)
+        if task:
+            task.cancel()
     try:
         await application.updater.stop()
         await application.stop()

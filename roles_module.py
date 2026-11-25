@@ -27,6 +27,7 @@
 
 import asyncio
 import html
+import re
 import logging
 import os
 import sqlite3
@@ -38,7 +39,7 @@ import pytz
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
 log = logging.getLogger(__name__)
@@ -127,6 +128,13 @@ def init_db():
           PRIMARY KEY(chat_id,thread_id,user_id));
         CREATE TABLE IF NOT EXISTS panel_pending(
           session_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS panel_cmd_done(           -- أوامر اللوحة المنفَّذة: تمنع تنفيذ أمر مرتين إن فشل تأكيده
+          cmd_id INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          ok INTEGER NOT NULL,
+          result TEXT NOT NULL DEFAULT '',
+          done_at TEXT NOT NULL,
+          PRIMARY KEY(cmd_id, created_at));
         CREATE TABLE IF NOT EXISTS stickers(
           scope_chat_id INTEGER NOT NULL DEFAULT 0,
           event TEXT NOT NULL,
@@ -140,6 +148,10 @@ def init_db():
         add_column(db, "sessions", "waitlist_open INTEGER NOT NULL DEFAULT 1")
         add_column(db, "sessions", "opened_by INTEGER")
         add_column(db, "sessions", "ended_at TEXT")
+        had_reg_column = "registration_closed" in column_names(db, "sessions")
+        add_column(db, "sessions", "registration_closed INTEGER NOT NULL DEFAULT 0")
+        if not had_reg_column:                              # قبل هذا الإصدار كان بدء الأدوار يعني إغلاق التسجيل
+            db.execute("UPDATE sessions SET registration_closed=1 WHERE status IN ('running','paused','review','finished')")
         add_column(db, "entries", "queue_type TEXT NOT NULL DEFAULT 'main'")
         if legacy_sessions:
             db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE status IN ('open','running','review','paused')",
@@ -157,6 +169,8 @@ def now_iso():
 # فإن تعذّر الاتصال أعادت panel_retry_loop المحاولة. أي فشل هنا لا يؤثر في عمل الجلسة داخل تيليغرام.
 PANEL_URL = ""
 PANEL_API_KEY = ""
+MANAGER_IN_GROUP = True      # False: لا تُرسل لوحة المعلمة إلى المجموعة؛ تتحكم من صفحتها في اللوحة
+COMMAND_POLL = 2.0
 _push_state = {}          # session_id -> "running" | "dirty"
 _push_tasks = set()
 
@@ -206,6 +220,10 @@ async def roles_enabled_here(chat_id, thread_id):
     return decide_enabled(_settings_cache["data"], chat_id, thread_id)
 
 
+def _plain(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).replace("\u200f", "").strip()
+
+
 def build_snapshot(db, sid):
     s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
     if not s:
@@ -216,6 +234,8 @@ def build_snapshot(db, sid):
         "session_key": s["session_key"], "chat_id": s["chat_id"], "thread_id": s["thread_id"],
         "course": s["course"], "opened_by": s["teacher"] or "", "opened_at": s["created_at"],
         "ended_at": s["ended_at"] or "", "status": s["status"], "capacity": s["capacity"],
+        "registration_closed": int(s["registration_closed"] or 0), "waitlist_open": int(s["waitlist_open"] or 0),
+        "report_preview": (_plain(report_text(db, sid, True))[:6000] if s["status"] == "review" else ""),
         "snapshot_at": now_iso(),
         "entries": [{"user_id": r["user_id"], "display_name": r["display_name"], "username": r["username"] or "",
                      "queue_type": r["queue_type"], "status": r["status"], "position": r["position"],
@@ -286,6 +306,102 @@ async def panel_retry_loop(interval=60):
         except Exception as exc:
             log.warning("فشل دورة إعادة الإرسال إلى اللوحة: %s", exc)
 
+
+
+# ───────────── أوامر المعلمة القادمة من اللوحة ─────────────
+def _fetch_commands():
+    r = requests.get(f"{PANEL_URL}/api/roles/commands", timeout=8,
+                     headers={"Authorization": f"Bearer {PANEL_API_KEY}"})
+    r.raise_for_status()
+    return r.json().get("commands", [])
+
+
+def _post_ack(cmd_id, ok, result):
+    r = requests.post(f"{PANEL_URL}/api/roles/commands/{cmd_id}/ack", json={"ok": ok, "result": result}, timeout=8,
+                      headers={"Authorization": f"Bearer {PANEL_API_KEY}"})
+    r.raise_for_status()
+
+
+def execute_panel_command(cmd):
+    """ينفّذ أمرًا مرة واحدة على الأكثر. يعيد (ok, النتيجة, sid, الإجراء, هل يُعلَن الدور، هل كان منفَّذًا من قبل)."""
+    cid, stamp = int(cmd["id"]), str(cmd.get("created_at") or "")
+    action = str(cmd.get("action") or "")
+    with closing(db_connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        prev = db.execute("SELECT ok,result FROM panel_cmd_done WHERE cmd_id=? AND created_at=?", (cid, stamp)).fetchone()
+        if prev:
+            return bool(prev["ok"]), prev["result"], None, action, False, True
+        s = db.execute("SELECT * FROM sessions WHERE session_key=?", (cmd.get("session_key"),)).fetchone()
+        ok, result, announce, sid = False, "", False, None
+        try:
+            if not s:
+                raise _Early("الجلسة غير موجودة في البوت.")
+            sid = s["id"]
+            if s["status"] == "finished":
+                raise _Early("انتهت الجلسة.")
+            if action not in PANEL_ACTIONS:
+                raise _Early("إجراء غير مدعوم.")
+            result, announce = apply_manager_action(db, s, action, cmd.get("expect_user"))
+            ok = True
+        except _Early as early:
+            db.rollback()
+            result = str(early)
+        db.execute("INSERT OR IGNORE INTO panel_cmd_done(cmd_id,created_at,ok,result,done_at) VALUES(?,?,?,?,?)",
+                   (cid, stamp, int(ok), result, now_iso()))
+        db.commit()
+    return ok, result, sid, action, announce, False
+
+
+PANEL_ACTIONS = {"start", "regtoggle", "done", "absent", "excusenow", "defer", "next", "pause", "limitup",
+                 "limitdown", "waittoggle", "finish", "reopen", "approve"}
+
+
+async def handle_panel_command(bot, cmd):
+    ctx = _BotCtx(bot)
+    ok, result, sid, action, announce, repeated = execute_panel_command(cmd)
+    try:
+        await asyncio.to_thread(_post_ack, cmd["id"], ok, result)       # فشل التأكيد: يُعاد تسليم الأمر ولا يُنفَّذ ثانية
+    except Exception as exc:
+        log.warning("تعذّر تأكيد الأمر %s للوحة: %s", cmd["id"], exc)
+    if repeated or sid is None:
+        return
+    if ok:
+        schedule_push(sid)
+        request_refresh(ctx, sid)
+        try:
+            if action == "approve":
+                await send_final_report(ctx, sid)
+                with closing(db_connect()) as db:
+                    fresh = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+                await send_sticker_event(ctx, fresh, "finish")
+            elif action == "finish":
+                await send_report_preview(ctx, sid)
+            elif announce:
+                await announce_current(ctx, sid)
+        except TelegramError:
+            log.exception("تعذر إرسال إشعار الأدوار بعد أمر اللوحة")
+
+
+async def command_loop():
+    """يسحب أوامر المعلمات من اللوحة وينفّذها بالترتيب."""
+    while True:
+        await asyncio.sleep(COMMAND_POLL)
+        if not panel_enabled():
+            continue
+        try:
+            cmds = await asyncio.to_thread(_fetch_commands)
+            for cmd in cmds:
+                await handle_panel_command(_COMMAND_BOT["bot"], cmd)
+        except Exception as exc:
+            log.warning("فشل سحب أوامر اللوحة: %s", exc)
+
+
+_COMMAND_BOT = {"bot": None}
+
+
+def start_command_loop(application):
+    _COMMAND_BOT["bot"] = application.bot
+    return asyncio.create_task(command_loop())
 
 
 def scope(update):
@@ -361,36 +477,41 @@ def unique_key(chat_id, thread_id):
     return f"{chat_id}:{thread_id}:{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}"
 
 
-def student_keyboard(sid, status, waitlist_open):
-    if status in ("running", "paused"):                  # بعد إغلاق التسجيل: الاعتذار واللائحة فقط
+def student_keyboard(sid, status, waitlist_open, reg_closed=False):
+    if status in ("open", "running", "paused") and not reg_closed:   # التسجيل يبقى مفتوحًا حتى تغلقه المعلمة صراحة
+        rows = [[InlineKeyboardButton("📝 أخذ دور", callback_data=f"roles:join:{sid}"),
+                 InlineKeyboardButton("❌ إلغاء دوري", callback_data=f"roles:cancel:{sid}")],
+                [InlineKeyboardButton("♻️ اعتذار", callback_data=f"roles:excuse:{sid}"),
+                 InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]]
+        if not waitlist_open:
+            rows.append([InlineKeyboardButton("قائمة الانتظار مغلقة", callback_data=f"roles:list:{sid}")])
+        return InlineKeyboardMarkup(rows)
+    if status in ("open", "running", "paused"):                  # أُغلق التسجيل: الاعتذار واللائحة فقط
         return InlineKeyboardMarkup([[InlineKeyboardButton("♻️ اعتذار", callback_data=f"roles:excuse:{sid}"),
                                       InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]])
-    if status != "open":
-        return InlineKeyboardMarkup([[InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]])
-    rows = [[InlineKeyboardButton("📝 أخذ دور", callback_data=f"roles:join:{sid}"),
-             InlineKeyboardButton("❌ إلغاء دوري", callback_data=f"roles:cancel:{sid}")],
-            [InlineKeyboardButton("♻️ اعتذار", callback_data=f"roles:excuse:{sid}"),
-             InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]]
-    if not waitlist_open:
-        rows.append([InlineKeyboardButton("قائمة الانتظار مغلقة", callback_data=f"roles:list:{sid}")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📋 عرض اللائحة", callback_data=f"roles:list:{sid}")]])
 
 
-def manager_keyboard(sid, status, waitlist_open):
+def manager_keyboard(sid, status, waitlist_open, reg_closed=False):
     if status == "review":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ اعتماد التقرير", callback_data=f"roles:approve:{sid}"),
              InlineKeyboardButton("↩️ العودة للجلسة", callback_data=f"roles:reopen:{sid}")]])
     if status == "finished":
         return None
+    reg_btn = InlineKeyboardButton("🔓 فتح التسجيل" if reg_closed else "🔒 إغلاق التسجيل",
+                                   callback_data=f"roles:regtoggle:{sid}")
+    if status == "open":
+        control = [InlineKeyboardButton("▶️ بدء الأدوار", callback_data=f"roles:start:{sid}"), reg_btn]
+    else:
+        control = [reg_btn, InlineKeyboardButton("⏸ إيقاف مؤقت", callback_data=f"roles:pause:{sid}")]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ اكتمل الدور", callback_data=f"roles:done:{sid}"),
          InlineKeyboardButton("⏭ غائبة", callback_data=f"roles:absent:{sid}")],
         [InlineKeyboardButton("♻️ معتذرة", callback_data=f"roles:excusenow:{sid}")],
         [InlineKeyboardButton("🔄 إلى آخر اللائحة", callback_data=f"roles:defer:{sid}"),
          InlineKeyboardButton("▶️ استدعاء الحالية", callback_data=f"roles:next:{sid}")],
-        [InlineKeyboardButton("🔒 إغلاق التسجيل", callback_data=f"roles:close:{sid}"),
-         InlineKeyboardButton("⏸ إيقاف مؤقت", callback_data=f"roles:pause:{sid}")],
+        control,
         [InlineKeyboardButton("➕ زيادة الحد", callback_data=f"roles:limitup:{sid}"),
          InlineKeyboardButton("➖ خفض الحد", callback_data=f"roles:limitdown:{sid}")],
         [InlineKeyboardButton("🔐 إغلاق الانتظار" if waitlist_open else "🔓 فتح الانتظار",
@@ -427,7 +548,9 @@ def student_text(db, sid):
     lines += ["", STAR_DIVIDER,
               f"📌 الأدوار الأساسية: <b>{len(main)} من {s['capacity']}</b>",
               f"🕰 قائمة الانتظار: <b>{len(waiting)}</b>"]
-    state = {"open": "التسجيل مفتوح.", "running": "التسجيل مغلق وبدأت متابعة الأدوار.",
+    closed = bool(s["registration_closed"])
+    state = {"open": "التسجيل مغلق." if closed else "التسجيل مفتوح.",
+             "running": "بدأت متابعة الأدوار، والتسجيل مغلق." if closed else "بدأت متابعة الأدوار، والتسجيل ما زال مفتوحًا لمن تأخرت.",
              "review": "الجلسة في مراجعة التقرير.", "finished": "انتهت الجلسة."}
     lines.append(f"🔔 {state.get(s['status'], 'الجلسة متوقفة مؤقتًا.')}")
     return "\n".join(lines)
@@ -468,15 +591,70 @@ async def edit_message_safe(bot, **kwargs):
             raise
 
 
+_REFRESH_LOCKS = {}
+_REFRESH_STATE = {}
+_TASKS = set()
+REFRESH_GAP = 1.1          # تيليغرام يحدّ تعديل الرسالة الواحدة بنحو مرة في الثانية
+
+
+async def safe_answer(q, text=None, alert=False):
+    """الرد على الضغطة لا يُسقط المعالجة: استعلام قديم أو عطل شبكة لا يمنع بقية العمل."""
+    try:
+        await q.answer(text, show_alert=alert)
+    except TelegramError:
+        log.warning("تعذر الرد على ضغطة الزر")
+
+
+class _Early(Exception):
+    """رد مبكر للمستخدمة؛ يُرسل بعد إغلاق قاعدة البيانات لا أثناء حجزها."""
+
+
 async def refresh(context, sid):
+    lock = _REFRESH_LOCKS.setdefault(sid, asyncio.Lock())
+    async with lock:                                       # تُقرأ الحالة داخل القفل فلا تسبق لقطة قديمة لقطة أحدث
+        await _refresh_now(context, sid)
+
+
+async def _refresh_worker(context, sid):
+    st = _REFRESH_STATE[sid]
+    try:
+        while st["dirty"]:
+            st["dirty"] = False
+            try:
+                await refresh(context, sid)
+            except RetryAfter as exc:
+                st["dirty"] = True
+                wait = getattr(exc.retry_after, "total_seconds", lambda: exc.retry_after)()
+                await asyncio.sleep(float(wait) + 0.5)
+                continue
+            except Exception:
+                log.exception("تعذر تحديث رسالة الأدوار")
+            await asyncio.sleep(REFRESH_GAP)
+    finally:
+        st["running"] = False
+
+
+def request_refresh(context, sid):
+    """يطلب تحديث رسائل الجلسة دون انتظار؛ الطلبات المتتابعة تُجمَّع في تحديث واحد يعكس آخر حالة."""
+    st = _REFRESH_STATE.setdefault(sid, {"running": False, "dirty": False})
+    st["dirty"] = True
+    if st["running"]:
+        return
+    st["running"] = True
+    task = asyncio.get_running_loop().create_task(_refresh_worker(context, sid))
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
+
+
+async def _refresh_now(context, sid):
     with closing(db_connect()) as db:
         s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
         if not s:
             return
         student = student_text(db, sid)
         manager = manager_text(db, sid)
-        sk = student_keyboard(sid, s["status"], bool(s["waitlist_open"]))
-        mk = manager_keyboard(sid, s["status"], bool(s["waitlist_open"]))
+        sk = student_keyboard(sid, s["status"], bool(s["waitlist_open"]), bool(s["registration_closed"]))
+        mk = manager_keyboard(sid, s["status"], bool(s["waitlist_open"]), bool(s["registration_closed"]))
     common = dict(chat_id=s["chat_id"], parse_mode=ParseMode.HTML)
     if s["message_id"]:
         await edit_message_safe(context.bot, message_id=s["message_id"], text=student, reply_markup=sk, **common)
@@ -620,8 +798,21 @@ async def open_command(update, context):
         return
     typed_title = " ".join(context.args or []).strip()
     with closing(db_connect()) as db:
-        if active_session(db, chat_id, thread_id):
-            await update.effective_message.reply_text("توجد جلسة مفتوحة في هذا الموضوع بالفعل."); return
+        existing = active_session(db, chat_id, thread_id)
+        if existing:
+            sid_existing = existing["id"]
+        else:
+            sid_existing = None
+    if sid_existing:
+        # جلسة قائمة لكن رسائلها قد لا تكون ظاهرة (حُذفت أو لم تُرسل): تُعاد نشرها بدل الرفض
+        try:
+            await repost_session_messages(context.bot, sid_existing, chat_id, thread_id)
+            await update.effective_message.reply_text("توجد جلسة مفتوحة بالفعل؛ أُعيد نشر لوحتها في هذا الموضوع.")
+        except Exception:
+            log.exception("تعذر إعادة نشر لوحة الجلسة")
+            await update.effective_message.reply_text("توجد جلسة مفتوحة، وتعذر إعادة نشر لوحتها. تحققي من صلاحيات البوت في الموضوع.")
+        return
+    with closing(db_connect()) as db:
         setting = topic_setting(db, chat_id, thread_id)
         title = typed_title or (setting["title"] if setting else "") or update.effective_chat.title or "الحصة"
         capacity = setting["capacity"] if setting else DEFAULT_CAPACITY
@@ -641,15 +832,38 @@ async def open_command(update, context):
     if sticker_sent is False:
         await update.effective_message.reply_text(
             "⚠️ فُتح التسجيل، لكن تعذر إرسال ملصق البداية. تحققي من صلاحية إرسال الملصقات ثم أعيدي ضبطه.")
-    student = await context.bot.send_message(chat_id, "جاري فتح الأدوار…", **thread_kwargs(thread_id))
-    manager = await context.bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
-    with closing(db_connect()) as db:
-        db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
-                   (student.message_id, manager.message_id, sid)); db.commit()
-    schedule_push(sid)
-    await refresh(context, sid)
+    try:
+        student = await context.bot.send_message(chat_id, "جاري فتح الأدوار…", **thread_kwargs(thread_id))
+        manager = (await context.bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
+                   if MANAGER_IN_GROUP else None)
+        with closing(db_connect()) as db:
+            db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
+                       (student.message_id, manager.message_id if manager else None, sid)); db.commit()
+        schedule_push(sid)
+        await refresh(context, sid)
+    except Exception:
+        with closing(db_connect()) as db:                       # جلسة بلا رسائل تحجز الموضوع؛ تُنهى كي لا تمنع المحاولة التالية
+            db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE id=? AND message_id IS NULL",
+                       (now_iso(), sid)); db.commit()
+        raise
     try:
         await context.bot.pin_chat_message(chat_id, student.message_id, disable_notification=True)
+    except (BadRequest, Forbidden):
+        log.warning("تعذر تثبيت رسالة الجلسة")
+
+
+async def repost_session_messages(bot, sid, chat_id, thread_id):
+    """ينشر رسالة الطالبات (وإدارة المجموعة إن فُعّلت) من جديد لجلسة قائمة ويحدّث معرّفاتها."""
+    student = await bot.send_message(chat_id, "جاري فتح الأدوار…", **thread_kwargs(thread_id))
+    manager = (await bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
+               if MANAGER_IN_GROUP else None)
+    with closing(db_connect()) as db:
+        db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
+                   (student.message_id, manager.message_id if manager else None, sid)); db.commit()
+    schedule_push(sid)
+    await refresh(_BotCtx(bot), sid)
+    try:
+        await bot.pin_chat_message(chat_id, student.message_id, disable_notification=True)
     except (BadRequest, Forbidden):
         log.warning("تعذر تثبيت رسالة الجلسة")
 
@@ -705,14 +919,85 @@ async def announce_current(context, sid):
     await context.bot.send_message(s["chat_id"], text, parse_mode=ParseMode.HTML, **session_scope(s))
 
 
+def apply_manager_action(db, s, action, expect_user=None):
+    """ينفّذ إجراء المعلمة على جلسة داخل معاملة مفتوحة، ويُنهيها بـ commit. يعيد (نص الرد، هل يُعلَن الدور الحالي)."""
+    sid = s["id"]
+    announce = False
+    if action in {"done", "absent", "excusenow", "defer"} and expect_user is not None:
+        cur = current_entry(db, sid)
+        if cur and int(cur["user_id"]) != int(expect_user):
+            raise _Early("تغيّر الدور الحالي؛ حدّثي الصفحة.")
+    answer = "تم."
+    if action == "start":
+        if s["status"] != "open":
+            raise _Early("بدأت الأدوار بالفعل.")
+        db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
+        advance(db, sid); announce = True
+        answer = "بدأت الأدوار، والتسجيل ما زال مفتوحًا."
+    elif action == "regtoggle":
+        closed = 0 if s["registration_closed"] else 1
+        db.execute("UPDATE sessions SET registration_closed=? WHERE id=?", (closed, sid))
+        answer = "أُغلق التسجيل." if closed else "فُتح التسجيل."
+    elif action == "close":                                # زر قديم في رسائل سابقة: يبدأ الأدوار ويغلق التسجيل كما كان
+        db.execute("UPDATE sessions SET status='running',registration_closed=1 WHERE id=?", (sid,))
+        advance(db, sid); announce = True
+    elif action in {"done", "absent", "excusenow"}:
+        current = current_entry(db, sid)
+        if not current:
+            raise _Early("لا يوجد دور حالي.")
+        db.execute("UPDATE entries SET status=? WHERE id=?",
+                   ("excused" if action == "excusenow" else action, current["id"]))
+        promote_waitlist(db, sid); advance(db, sid); announce = True
+    elif action == "defer":
+        current = current_entry(db, sid)
+        if not current:
+            raise _Early("لا يوجد دور حالي.")
+        pos = db.execute(
+            "SELECT COALESCE(MAX(position),0)+1 FROM entries WHERE session_id=?",
+            (sid,)).fetchone()[0]
+        db.execute("UPDATE entries SET status='waiting',position=? WHERE id=?", (pos, current["id"]))
+        advance(db, sid); announce = True
+    elif action == "next":
+        advance(db, sid); announce = True
+    elif action == "pause":
+        new_status = "running" if s["status"] == "paused" else "paused"
+        db.execute("UPDATE sessions SET status=? WHERE id=?", (new_status, sid))
+        answer = "استؤنفت الجلسة." if new_status == "running" else "أوقفت الجلسة مؤقتًا."
+    elif action == "limitup":
+        db.execute("UPDATE sessions SET capacity=capacity+1 WHERE id=?", (sid,))
+        promote_waitlist(db, sid)
+    elif action == "limitdown":
+        current_capacity = s["capacity"]
+        if current_capacity > 1:
+            db.execute("UPDATE sessions SET capacity=capacity-1 WHERE id=?", (sid,))
+    elif action == "waittoggle":
+        db.execute("UPDATE sessions SET waitlist_open=1-waitlist_open WHERE id=?", (sid,))
+    elif action == "finish":
+        db.execute("UPDATE sessions SET status='review' WHERE id=?", (sid,))
+        answer = "راجعي التقرير ثم اعتمديه."
+    elif action == "reopen":
+        db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
+    elif action == "approve":
+        db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE id=?", (now_iso(), sid))
+    db.commit()
+    return answer, announce
+
+
 async def callback(update, context):
+    try:
+        await _callback_impl(update, context)
+    except _Early as early:
+        await safe_answer(update.callback_query, str(early), True)
+
+
+async def _callback_impl(update, context):
     q = update.callback_query
     announce = False
     try:
         _, action, raw_sid = q.data.split(":", 2)
         sid = int(raw_sid)
     except Exception:
-        await q.answer("زر غير صالح.", show_alert=True); return
+        raise _Early("زر غير صالح.")
     tg_admin = False
     if action not in {"join", "cancel", "excuse", "list"} and q.from_user.id not in ADMIN_IDS:
         tg_admin = await is_chat_admin(context.bot, q.message.chat.id, q.from_user.id)
@@ -720,27 +1005,28 @@ async def callback(update, context):
         db.execute("BEGIN IMMEDIATE")
         s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
         if not s:
-            await q.answer("الجلسة غير موجودة.", show_alert=True); return
+            raise _Early("الجلسة غير موجودة.")
         callback_thread = int(getattr(q.message, "message_thread_id", 0) or 0)
         if ALLOWED_CHAT_IDS and q.message.chat.id not in ALLOWED_CHAT_IDS:
-            await q.answer("إدارة الأدوار غير مفعّلة في هذه المجموعة.", show_alert=True)
-            return
+            raise _Early("إدارة الأدوار غير مفعّلة في هذه المجموعة.")
         if q.message.chat.id != s["chat_id"] or callback_thread != s["thread_id"]:
-            await q.answer("هذا الزر لا يخص هذا الموضوع.", show_alert=True); return
+            raise _Early("هذا الزر لا يخص هذا الموضوع.")
         manager = tg_admin or is_topic_staff(db, s["chat_id"], s["thread_id"], q.from_user.id)
         if action == "join":
-            if s["status"] != "open":
-                await q.answer("التسجيل مغلق.", show_alert=True); return
+            if s["status"] not in ("open", "running", "paused") or s["registration_closed"]:
+                raise _Early("التسجيل مغلق حاليًا.")
             existing = db.execute("SELECT * FROM entries WHERE session_id=? AND user_id=?",
                                   (sid, q.from_user.id)).fetchone()
-            if existing and existing["status"] not in ("cancelled", "excused"):
-                await q.answer("لديك دور مسجل بالفعل.", show_alert=True); return
+            if existing and existing["status"] == "done":
+                raise _Early("أتممتِ دورك في هذه الحصة.")
+            if existing and existing["status"] in ("waiting", "current"):     # الغائبة تستطيع التسجيل من جديد إن حضرت متأخرة
+                raise _Early("لديك دور مسجل بالفعل.")
             main_count = db.execute(
                 "SELECT COUNT(*) FROM entries WHERE session_id=? AND queue_type='main' AND status IN ('waiting','current')",
                 (sid,)).fetchone()[0]
             queue_type = "main" if main_count < s["capacity"] else "waitlist"
             if queue_type == "waitlist" and not s["waitlist_open"]:
-                await q.answer("اكتملت الأدوار وقائمة الانتظار مغلقة.", show_alert=True); return
+                raise _Early("اكتملت الأدوار وقائمة الانتظار مغلقة.")
             pos = db.execute(
                 "SELECT COALESCE(MAX(position),0)+1 FROM entries WHERE session_id=?",
                 (sid,)).fetchone()[0]
@@ -753,6 +1039,8 @@ async def callback(update, context):
                               status,registered_at) VALUES(?,?,?,?,?,?,'waiting',?)""",
                            (sid, q.from_user.id, q.from_user.full_name or "مشاركة", q.from_user.username,
                             queue_type, pos, now_iso()))
+            if s["status"] == "running" and queue_type == "main" and not current_entry(db, sid):
+                advance(db, sid); announce = True              # الجلسة جارية ولا أحد حاليًا: تتقدم المتأخرة فورًا
             db.commit()
             try:                                                # من أخذت دورًا فهي من طالبات الحصة؛ لا يؤثر فيه أي عطل
                 import students_module
@@ -766,7 +1054,7 @@ async def callback(update, context):
                 "SELECT * FROM entries WHERE session_id=? AND user_id=? AND status IN ('waiting','current')",
                 (sid, q.from_user.id)).fetchone()
             if not row:
-                await q.answer("لا يوجد لك دور قابل للإلغاء.", show_alert=True); return
+                raise _Early("لا يوجد لك دور قابل للإلغاء.")
             db.execute("UPDATE entries SET status='cancelled' WHERE id=?", (row["id"],))
             if row["queue_type"] == "main":
                 promote_waitlist(db, sid)
@@ -780,9 +1068,9 @@ async def callback(update, context):
                 "SELECT * FROM entries WHERE session_id=? AND user_id=? AND status IN ('waiting','current')",
                 (sid, q.from_user.id)).fetchone()
             if not row:
-                await q.answer("لا يوجد لك دور مسجَّل لتعتذري عنه.", show_alert=True); return
+                raise _Early("لا يوجد لك دور مسجَّل لتعتذري عنه.")
             if s["status"] not in ("open", "running", "paused"):
-                await q.answer("انتهت الجلسة.", show_alert=True); return
+                raise _Early("انتهت الجلسة.")
             db.execute("UPDATE entries SET status='excused' WHERE id=?", (row["id"],))
             if row["queue_type"] == "main":
                 promote_waitlist(db, sid)
@@ -795,63 +1083,25 @@ async def callback(update, context):
             answer = "تم تحديث اللائحة."
         else:
             if not manager:
-                await q.answer("هذه الأداة خاصة بإدارة هذا الموضوع.", show_alert=True); return
-            answer = "تم."
-            if action == "close":
-                db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
-                advance(db, sid); announce = True
-            elif action in {"done", "absent", "excusenow"}:
-                current = current_entry(db, sid)
-                if not current:
-                    await q.answer("لا يوجد دور حالي.", show_alert=True); return
-                db.execute("UPDATE entries SET status=? WHERE id=?",
-                           ("excused" if action == "excusenow" else action, current["id"]))
-                promote_waitlist(db, sid); advance(db, sid); announce = True
-            elif action == "defer":
-                current = current_entry(db, sid)
-                if not current:
-                    await q.answer("لا يوجد دور حالي.", show_alert=True); return
-                pos = db.execute(
-                    "SELECT COALESCE(MAX(position),0)+1 FROM entries WHERE session_id=?",
-                    (sid,)).fetchone()[0]
-                db.execute("UPDATE entries SET status='waiting',position=? WHERE id=?", (pos, current["id"]))
-                advance(db, sid); announce = True
-            elif action == "next":
-                advance(db, sid); announce = True
-            elif action == "pause":
-                new_status = "running" if s["status"] == "paused" else "paused"
-                db.execute("UPDATE sessions SET status=? WHERE id=?", (new_status, sid))
-                answer = "استؤنفت الجلسة." if new_status == "running" else "أوقفت الجلسة مؤقتًا."
-            elif action == "limitup":
-                db.execute("UPDATE sessions SET capacity=capacity+1 WHERE id=?", (sid,))
-                promote_waitlist(db, sid)
-            elif action == "limitdown":
-                current_capacity = s["capacity"]
-                if current_capacity > 1:
-                    db.execute("UPDATE sessions SET capacity=capacity-1 WHERE id=?", (sid,))
-            elif action == "waittoggle":
-                db.execute("UPDATE sessions SET waitlist_open=1-waitlist_open WHERE id=?", (sid,))
-            elif action == "finish":
-                db.execute("UPDATE sessions SET status='review' WHERE id=?", (sid,))
-                answer = "راجعي التقرير ثم اعتمديه."
-            elif action == "reopen":
-                db.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
-            elif action == "approve":
-                db.execute("UPDATE sessions SET status='finished',ended_at=? WHERE id=?", (now_iso(), sid))
+                raise _Early("هذه الأداة خاصة بإدارة هذا الموضوع.")
+            answer, announce = apply_manager_action(db, s, action)
             db.commit()
-    await q.answer(answer)
+    await safe_answer(q, answer)                                  # أولًا: تصل الاستجابة للطالبة فورًا
     if action != "list":
         schedule_push(sid)
-    if action == "approve":
-        await send_final_report(context, sid)
-        with closing(db_connect()) as db:
-            fresh = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
-        await send_sticker_event(context, fresh, "finish")
-    elif action == "finish":
-        await send_report_preview(context, sid)
-    elif announce:
-        await announce_current(context, sid)
-    await refresh(context, sid)
+    request_refresh(context, sid)                                 # تحديث الرسائل دون إيقاف بقية الضغطات
+    try:
+        if action == "approve":
+            await send_final_report(context, sid)
+            with closing(db_connect()) as db:
+                fresh = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+            await send_sticker_event(context, fresh, "finish")
+        elif action == "finish":
+            await send_report_preview(context, sid)
+        elif announce:
+            await announce_current(context, sid)
+    except TelegramError:
+        log.exception("تعذر إرسال إشعار الأدوار بعد تنفيذ الإجراء")
 
 
 def report_text(db, sid, preview=False):
@@ -908,6 +1158,8 @@ def report_text(db, sid, preview=False):
 
 
 async def send_report_preview(context, sid):
+    if not MANAGER_IN_GROUP:
+        return                                              # تظهر المعاينة في صفحة المعلمة، ولا يراها أعضاء المجموعة
     with closing(db_connect()) as db:
         s = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
         text = report_text(db, sid, True)
@@ -1036,10 +1288,11 @@ async def auto_open_session(bot, course, teacher, chat_id, thread_id=0):
         except Exception:
             log.exception("تعذر إرسال ملصق بدء الأدوار")
         student = await bot.send_message(chat_id, "جاري فتح الأدوار…", **thread_kwargs(thread_id))
-        manager = await bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
+        manager = (await bot.send_message(chat_id, "جاري إعداد لوحة الإدارة…", **thread_kwargs(thread_id))
+                   if MANAGER_IN_GROUP else None)
         with closing(db_connect()) as db:
             db.execute("UPDATE sessions SET message_id=?,management_message_id=? WHERE id=?",
-                       (student.message_id, manager.message_id, sid)); db.commit()
+                       (student.message_id, manager.message_id if manager else None, sid)); db.commit()
         schedule_push(sid)
         await refresh(ctx, sid)
     except Exception:
@@ -1057,6 +1310,7 @@ async def auto_open_session(bot, course, teacher, chat_id, thread_id=0):
 def register_roles(application, *, group=0):
     """تهيئة قاعدة الأدوار وإضافة المعالجات مرة واحدة قبل بدء التطبيق."""
     global ADMIN_IDS, ALLOWED_CHAT_IDS, DB_PATH, TZ, DEFAULT_CAPACITY, TELEGRAM_ADMINS, PANEL_URL, PANEL_API_KEY
+    global MANAGER_IN_GROUP, COMMAND_POLL
 
     if application.bot_data.get("roles_registered"):
         return
@@ -1071,6 +1325,8 @@ def register_roles(application, *, group=0):
     TELEGRAM_ADMINS = os.getenv("ROLES_TELEGRAM_ADMINS", "true").strip().lower() not in {"0", "false", "no", "off"}
     PANEL_URL = os.getenv("PANEL_URL", "").strip().rstrip("/")
     PANEL_API_KEY = os.getenv("PANEL_API_KEY", "").strip()
+    MANAGER_IN_GROUP = os.getenv("ROLES_MANAGER_IN_GROUP", "true").strip().lower() not in {"0", "false", "no", "off"}
+    COMMAND_POLL = max(1.0, float(os.getenv("ROLES_COMMAND_POLL", "2")))
     init_db()
 
     commands = {
